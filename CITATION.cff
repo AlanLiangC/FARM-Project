@@ -1,0 +1,37 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the FARM paper."
+title: "FARM: Find Anything using Relational Spatial Memory"
+repository-code: "https://github.com/GoldenGait/FARM-Project"
+url: "https://goldengait.github.io/farm/"
+license: AGPL-3.0-or-later
+authors:
+  - family-names: He
+    given-names: Siming
+preferred-citation:
+  type: generic
+  title: "FARM: Find Anything using Relational Spatial Memory"
+  year: 2026
+  url: "https://arxiv.org/abs/2606.15476"
+  identifiers:
+    - type: other
+      value: "arXiv:2606.15476"
+      description: "arXiv preprint"
+  authors:
+    - family-names: He
+      given-names: Siming
+    - family-names: Huang
+      given-names: Leo
+    - family-names: Lilja
+      given-names: Adam
+    - family-names: Huebel
+      given-names: Fabio
+    - family-names: Frey
+      given-names: Jonas
+    - family-names: Pavone
+      given-names: Marco
+    - family-names: Sastry
+      given-names: S. Shankar
+    - family-names: Malik
+      given-names: Jitendra
+    - family-names: Tomlin
+      given-names: Claire

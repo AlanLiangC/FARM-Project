@@ -1,0 +1,34 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+
+# Local-only env files (API keys, etc.)
+docker/**/.env
+.env
+
+# Downloaded model weights (fetched by bootstrap_models.sh).
+# models/dinov3-vits16 is committed in-repo and stays tracked.
+models/*
+!models/dinov3-vits16/
+
+# Rosbags / mcap data
+*.mcap
+
+# Local run outputs
+/output/
+/log/
+FARM-Project-*.tar.gz
+
+# Colcon artifacts (colcon writes into the bind-mounted repo root)
+/build/
+/install/
+
+# Scene-state outputs
+*.pt
+
+# Editor / OS droppings
+.vscode/
+.idea/
+.DS_Store

@@ -1,0 +1,32 @@
+services:
+  scene-graph:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        UID: ${UID:-1000}
+        GID: ${GID:-1000}
+    image: scene_graph:latest
+    container_name: scene_graph
+    network_mode: host
+    ipc: host
+    shm_size: "16g"
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - DISPLAY=${DISPLAY:-}
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
+    volumes:
+      # Mount source for development (overrides COPY in Dockerfile)
+      - ../src:/home/scene_graph/scene_graph/src
+      - ../ros:/home/scene_graph/scene_graph/ros
+      - ../scripts:/home/scene_graph/scene_graph/scripts
+      - ../configs:/home/scene_graph/scene_graph/configs
+      - ../models:/home/scene_graph/scene_graph/models
+      # Vendored third-party packages (the YOLOE submodule).
+      - ../third_party:/home/scene_graph/scene_graph/third_party
+      # Optional: mount dataset directory
+      # - /data:/data
+    stdin_open: true
+    tty: true

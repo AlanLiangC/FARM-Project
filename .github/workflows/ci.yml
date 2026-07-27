@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install package (CPU-only, no CUDA needed for these tests)
+        run: |
+          pip install torch torchvision torchaudio \
+            --index-url https://download.pytorch.org/whl/cpu
+          pip install \
+            -e third_party/yoloe/third_party/ml-mobileclip \
+            -e third_party/yoloe \
+            -e ".[dev]"
+
+      - name: Byte-compile library and scripts
+        run: python -m compileall -q src scripts
+
+      - name: Run unit tests
+        run: pytest tests/ -v

@@ -1,0 +1,29 @@
+name: Release source archive
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          submodules: recursive
+
+      - name: Build complete source archive
+        run: |
+          ./scripts/create_source_archive.sh \
+            "FARM-Project-${{ github.event.release.tag_name }}.tar.gz"
+
+      - name: Attach archive to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            "FARM-Project-${{ github.event.release.tag_name }}.tar.gz"

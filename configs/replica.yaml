@@ -1,0 +1,35 @@
+dataset:
+  name: "Replica"
+  start: 0
+  end: -1
+  stride: 5
+  desired_height: 680
+  desired_width: 1200
+  camera_params:
+    image_height: 680
+    image_width: 1200
+    fx: 600.0
+    fy: 600.0
+    cx: 599.5
+    cy: 339.5
+    png_depth_scale: 6553.5 # for depth image in png format
+    crop_edge: 0
+
+segmentation:
+  model_id: "yoloe-v8l"
+  vocab_file: "configs/yoloe_vocabulary.txt"
+  imgsz: 640
+  conf_thres: 0.25
+  iou_thres: 0.5
+  mask_erosion_px: 3
+  mahalanobis_thresh: 2.0
+  use_dino_features: false
+
+storage:
+  compression: "zstd"
+  zstd_level: 6
+  image_dir: "log/image_store"
+
+run:
+  batch_size: 5
+  log_every: 25

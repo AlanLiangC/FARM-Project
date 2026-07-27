@@ -1,0 +1,67 @@
+dataset:
+  name: "npz"
+  base_dir: /data/your_npz_dataset
+  sequence: "example_sequence"
+  start: 0
+  end: -1
+  stride: 1
+  npz_depth_scale: 1.0
+  relative_pose: False
+
+online_captioning:
+  enabled: true
+  growth_threshold: 1.5
+  cooldown_steps: 5
+  max_contributing_steps: 10
+  updates_queue_size: 0
+  drop_oldest_when_full: true
+  update_period: 20
+  captioning:
+    enabled: true
+    results_queue_size: 0
+    min_views_for_caption: 3
+    num_views: 5
+    top_k: 1
+    min_fraction_in_fov: 0.7
+    include_neighbors: false
+    neighbor_radius: 0
+    max_retries: 1
+    retry_delay_sec: 20.0
+    retry_timeout_sec: 60.0
+    batch_size: 16
+    model:
+      type: llava
+      model_id: qwen3-vl:4b-instruct
+      device: cuda:0
+
+
+cache:
+  vram_high_watermark: 0.9
+  vram_low_watermark: 0.75
+  ram_high_watermark: 0.9
+  ram_low_watermark: 0.75
+  pin_radius: 1
+  weights:
+    recency: 0.5
+    proximity: 0.3
+    size: 0.1
+    write: 0.1
+
+storage:
+  compression: "zstd"
+  zstd_level: 6
+  image_dir: "log/image_store"
+
+segmentation:
+  model_id: "yoloe-v8l"
+  vocab_file: "configs/yoloe_vocabulary.txt"
+  imgsz: 640
+  conf_thres: 0.25
+  iou_thres: 0.5
+  mask_erosion_px: 3
+  mahalanobis_thresh: 2.0
+  use_dino_features: false
+
+run:
+  batch_size: 5
+  log_every: 25

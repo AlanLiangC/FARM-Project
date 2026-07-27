@@ -1,0 +1,62 @@
+[project]
+name = "farm-scene-graph"
+version = "1.0.0"
+description = "FARM: Find Anything using Relational Spatial Memory - real-time open-vocabulary 3D scene-graph memory and retrieval from RGBD streams (imports as `scene_graph`)"
+readme = "README.md"
+license = "AGPL-3.0-or-later"
+authors = [
+    { name = "Siming He", email = "siminghe@berkeley.edu" },
+]
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "torch>=2.0",
+    "torchvision",
+    "torchaudio",
+    "transformers>=4.57.0",
+    "ultralytics",
+    "opencv-python",
+    "h5py",
+    "huggingface_hub",
+    "loguru",
+    "numpy",
+    "Pillow",
+    "PyYAML",
+    "requests",
+    "networkx>=2.8",
+    "supervision",
+    "tqdm",
+    "timm",
+    "scikit-learn",
+    "scipy",
+    "transforms3d",
+    "matplotlib",
+    "imageio[ffmpeg]",
+    "viser",
+]
+
+[project.urls]
+Homepage = "https://goldengait.github.io/farm/"
+Repository = "https://github.com/GoldenGait/FARM-Project"
+Paper = "https://arxiv.org/abs/2606.15476"
+Dataset = "https://huggingface.co/datasets/GoldenGait/FARM-Scenes"
+
+[project.optional-dependencies]
+vllm = [
+    "vllm>=0.20.0",
+    "accelerate",
+    "safetensors",
+    "qwen-vl-utils>=0.0.14",
+]
+dev = ["pytest", "black", "flake8"]
+
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# Host-side uv/micromamba workflows are not supported. All builds happen inside
+# the Docker container (see docker/Dockerfile). The Dockerfile uses uv only as
+# a faster pip front-end via ``uv pip install``; it does not rely on a uv
+# workspace, so the ``[tool.uv.*]`` sections were removed.

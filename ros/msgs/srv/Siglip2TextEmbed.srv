@@ -1,0 +1,9 @@
+string[] texts
+bool normalize
+int32 client_id
+---
+bool ok
+string error
+int32 dim
+float32[] embeddings_flat
+int32 n_texts

@@ -1,0 +1,4 @@
+[submodule "third_party/yoloe"]
+	path = third_party/yoloe
+	url = https://github.com/GoldenGait/yoloe.git
+	branch = scene-graph-separate-integration

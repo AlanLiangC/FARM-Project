@@ -1,0 +1,12 @@
+# FARM-Scenes warehouse (grandtour/2024-11-25_warehouse) — example queries for the viser Query panel.
+# Hand-curated demo set covering the relational predicates (right/left of, near,
+# below, next to, farthest), verified against the retrieval stack.
+# Usage: scripts/view_scene_state.py --query-examples configs/query_examples/warehouse.txt
+blue door to the right of a blue storage case
+cardboard box near a metal ladder
+storage rack to the right of a red industrial forklift
+the white table below a white board
+Gray wheeled trash can to the left of an orange metal pallet jack
+Large gray trash can next to a blue storage container
+green trash can to the left of a white garage door
+Vehicle farthest from the yellow tripod-mounted surveying tool
