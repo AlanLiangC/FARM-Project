@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import logging
 import os
 from typing import List, Sequence, Union
 
@@ -35,6 +36,7 @@ except Exception:
 # loads fully offline. ``DEFAULT_MODEL`` is the offline-safe fallback id used
 # only when neither local dir exists.
 DEFAULT_MODEL = "facebook/dinov3-vits16-pretrain-lvd1689m"
+LOGGER = logging.getLogger(__name__)
 
 
 def _to_pil(img: Union[np.ndarray, torch.Tensor, Image.Image]) -> Image.Image:
@@ -124,6 +126,18 @@ class DINOFeaturesExtractor:
             )
             .eval()
             .to(self.device)
+        )
+        loaded_cfg = getattr(self.model, "config", object())
+        LOGGER.info(
+            "Loaded DINO backbone: source=%s model=%s class=%s hidden_size=%s "
+            "patch_size=%s gated_mlp=%s device=%s",
+            model_src,
+            model,
+            type(self.model).__name__,
+            getattr(loaded_cfg, "hidden_size", None),
+            getattr(loaded_cfg, "patch_size", None),
+            getattr(loaded_cfg, "use_gated_mlp", None),
+            self.device,
         )
         if self.channels_last and self.device.type == "cuda":
             self.model.to(memory_format=torch.channels_last)

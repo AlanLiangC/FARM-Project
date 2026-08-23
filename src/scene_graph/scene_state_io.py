@@ -329,6 +329,9 @@ def load_scene_state(
     restored["object_caption"] = _ensure_list_len(restored.get("object_caption", []), N, "")
     restored["object_caption_decision"] = _ensure_list_len(restored.get("object_caption_decision", []), N, "")
     restored["object_category"] = _ensure_list_len(restored.get("object_category", []), N, "")
+    restored["object_detection_category"] = _ensure_list_len(
+        restored.get("object_detection_category", []), N, ""
+    )
     restored["object_supercategory"] = _ensure_list_len(restored.get("object_supercategory", []), N, "")
     restored["object_category_candidates"] = _ensure_list_len(
         restored.get("object_category_candidates", []), N, list
@@ -391,6 +394,14 @@ def load_scene_state(
             out[key] = score
         normalized_det.append(out)
     restored["object_detection_category_conf"] = normalized_det
+    detected_rows = restored.get("object_detection_category")
+    detected_rows = detected_rows if isinstance(detected_rows, list) else []
+    detected_rows = _ensure_list_len(detected_rows, N, "")
+    for idx, entry in enumerate(normalized_det):
+        if not detected_rows[idx] and entry:
+            with contextlib.suppress(Exception):
+                detected_rows[idx] = str(max(entry.items(), key=lambda item: float(item[1]))[0]).strip()
+    restored["object_detection_category"] = detected_rows
 
     loser = restored.get("loser_object_ids")
     loser_list: list = loser if isinstance(loser, list) else []

@@ -267,6 +267,7 @@ def add_object_to_scene_state(
 
     _ensure_list("object_siglip2_embedding_history", list).append([])
     _ensure_list("object_qwen3_vl_embedding_history", list).append([])
+    _ensure_list("object_detection_category", "").append("")
     _ensure_list("object_detection_category_conf", dict).append({})
     _ensure_list("loser_object_ids", set).append(set())
 

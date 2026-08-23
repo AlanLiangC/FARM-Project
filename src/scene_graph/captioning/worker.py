@@ -255,6 +255,9 @@ class CaptionWorker:
 
         # Embedding model settings
         self._retry_pending_object_ids: set[int] = set()
+        self._caption_text_embed_enabled: bool = str(
+            os.getenv("CAPTION_TEXT_EMBED_ENABLED", "1")
+        ).strip().lower() not in {"0", "false", "no", "off"}
         self._embed_model: str = os.getenv("VLLM_EMBED_MODEL", "qwen3-emb-0.6b")
         self._embed_base_url: str = os.getenv("VLLM_EMBED_BASE_URL", "http://localhost:8002/v1")
         self._embed_timeout_s: float = float(os.getenv("VLLM_EMBED_TIMEOUT_S", "30"))
@@ -2251,6 +2254,8 @@ class CaptionWorker:
         """
         if not captions:
             return []
+        if not self._caption_text_embed_enabled:
+            return [[] for _ in range(len(captions))]
 
         def _canonicalize_for_embedding(text: str) -> str:
             # Light cleanup only: lowercase (plus trim whitespace).
@@ -2371,6 +2376,8 @@ class CaptionWorker:
         cleaned = [str(t or "").strip() for t in (texts or [])]
         if not cleaned or any(not t for t in cleaned):
             return False, "bad_request_empty_texts", []
+        if not self._caption_text_embed_enabled:
+            return False, "caption_text_embeddings_disabled", []
 
         # Probe once; _run_caption_embeddings() currently returns [] vectors when backend is down.
         if self._embed_server_ok is None:

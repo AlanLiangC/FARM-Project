@@ -12,7 +12,8 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from typing import Dict, Sequence
+from pathlib import Path
+from typing import Dict, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -30,6 +31,7 @@ except Exception:  # pragma: no cover - viser is optional or may fail to import 
 
 from scene_graph.utils.geometry import decode_voxel_keys_numpy as _decode_voxel_keys
 from scene_graph.utils.geometry import voxel_cloud_aabb as _voxel_cloud_aabb
+from scene_graph.map_update.mask_observations import load_mask_observation
 
 
 @dataclass
@@ -314,6 +316,9 @@ class PipelineViserVisualizer:
         self._latest_caption_edit_texts: list[str] | None = None
         self._latest_images: list[object | None] | None = None
         self._latest_view_refs: list[str | None] | None = None
+        self._latest_object_indices: list[int] | None = None
+        self._latest_mask_observations: list[object] | None = None
+        self._latest_id_to_image_ref: dict[int, str] = {}
         self._view_image_cache: dict[str, np.ndarray] = {}
         self._latest_detection_ids: list[int] | None = None
         self._latest_detection_captions: list[str] | None = None
@@ -2348,16 +2353,28 @@ class PipelineViserVisualizer:
         supercategory: str,
         attributes: list[str],
         decision: str,
+        detector_category: str = "",
+        detector_scores: Mapping[str, float] | None = None,
+        mask_observation_count: int = 0,
     ) -> str:
+        scores = {
+            str(key): round(float(value), 4)
+            for key, value in sorted(
+                (detector_scores or {}).items(), key=lambda item: float(item[1]), reverse=True
+            )
+        }
         payload = {
-            "category": category,
-            "supercategory": supercategory,
-            "attributes": attributes,
-            "description": description,
-            "decision": decision,
+            "object_category": category,
+            "object_detection_category": detector_category,
+            "object_detection_category_conf": scores,
+            "object_mask_observation_count": max(0, int(mask_observation_count)),
+            "object_supercategory": supercategory,
+            "object_key_attributes": attributes,
+            "object_caption": description,
+            "object_caption_decision": decision,
         }
         lines = [
-            "**Caption JSON**",
+            "**Object graph dictionary**",
             "",
             "```json",
             json.dumps(payload, indent=2, ensure_ascii=False),
@@ -2449,10 +2466,12 @@ class PipelineViserVisualizer:
         object_captions = scene_state.get("object_caption") or []
         object_decisions = scene_state.get("object_caption_decision") or []
         object_categories = scene_state.get("object_category") or []
+        object_detection_categories = scene_state.get("object_detection_category") or []
         object_supercategories = scene_state.get("object_supercategory") or []
         object_key_attributes = scene_state.get("object_key_attributes") or []
         object_det_maps = scene_state.get("object_detection_category_conf") or []
         object_images_all = scene_state.get("rgb_observations") or []
+        object_masks_all = scene_state.get("object_mask_observations") or []
 
         if active is None or means is None or cov6 is None:
             return
@@ -2528,6 +2547,9 @@ class PipelineViserVisualizer:
                 else ""
             )
             category = self._string_value(self._row_value(object_categories, obj_idx_all, ""))
+            detector_category = self._string_value(
+                self._row_value(object_detection_categories, obj_idx_all, "")
+            )
             supercategory = self._string_value(self._row_value(object_supercategories, obj_idx_all, ""))
             key_attributes = self._string_list_value(self._row_value(object_key_attributes, obj_idx_all, []))
             decision = self._string_value(self._row_value(object_decisions, obj_idx_all, "")).lower()
@@ -2545,6 +2567,14 @@ class PipelineViserVisualizer:
                 supercategory=supercategory,
                 attributes=key_attributes,
                 decision=decision,
+                detector_category=detector_category,
+                detector_scores=det_map if isinstance(det_map, dict) else {},
+                mask_observation_count=(
+                    len(object_masks_all[obj_idx_all])
+                    if 0 <= obj_idx_all < len(object_masks_all)
+                    and isinstance(object_masks_all[obj_idx_all], list)
+                    else 0
+                ),
             )
             captions.append(caption_json)
             caption_edit_texts.append(caption_text)
@@ -2558,6 +2588,9 @@ class PipelineViserVisualizer:
         self._latest_caption_edit_texts = caption_edit_texts
         self._latest_images = images
         self._latest_view_refs = view_refs
+        self._latest_object_indices = [int(value) for value in active_indices_all]
+        self._latest_mask_observations = object_masks_all
+        self._latest_id_to_image_ref = id_to_image_ref
 
         # Colors
         colors = np.zeros((means_np.shape[0], 3), dtype=np.uint8)
@@ -3599,6 +3632,14 @@ class PipelineViserVisualizer:
         )
 
         img = self._prepare_image_gallery(img_raw)
+        obj_idx_all = (
+            self._latest_object_indices[idx]
+            if self._latest_object_indices is not None and idx < len(self._latest_object_indices)
+            else idx
+        )
+        mask_gallery = self._load_object_mask_gallery(obj_idx_all)
+        if mask_gallery is not None:
+            img = mask_gallery
         self._set_clicked_caption(obj_id, caption)
         self._set_clicked_image(img)
 
@@ -3856,6 +3897,40 @@ class PipelineViserVisualizer:
         if len(self._view_image_cache) > 64:
             self._view_image_cache.pop(next(iter(self._view_image_cache)))
         return arr
+
+    def _load_object_mask_gallery(self, obj_idx: int, max_views: int = 6) -> np.ndarray | None:
+        """Load saved object masks lazily and overlay them on their source RGB frames."""
+        rows = self._latest_mask_observations
+        if not isinstance(rows, list) or obj_idx < 0 or obj_idx >= len(rows):
+            return None
+        observations = rows[obj_idx]
+        if not isinstance(observations, list) or not observations:
+            return None
+        ordered = sorted(
+            (obs for obs in observations if isinstance(obs, Mapping)),
+            key=lambda obs: float(obs.get("score", 0.0) or 0.0),
+            reverse=True,
+        )
+        overlays: list[np.ndarray] = []
+        used_image_ids: set[int] = set()
+        for observation in ordered:
+            with contextlib.suppress(Exception):
+                image_id = int(observation.get("image_id"))
+                if image_id in used_image_ids:
+                    continue
+                ref = self._latest_id_to_image_ref.get(image_id)
+                rgb = self._load_image_ref(ref)
+                mask = load_mask_observation(observation, kind="raw")
+                if rgb is None or mask is None:
+                    continue
+                overlay = self._draw_mask_overlay(
+                    rgb.copy(), mask, color=(255, 40, 170), alpha=0.48
+                )
+                overlays.append(overlay)
+                used_image_ids.add(image_id)
+                if len(overlays) >= max(1, int(max_views)):
+                    break
+        return self._prepare_image_gallery(overlays) if overlays else None
 
     def _set_clicked_image(self, image: np.ndarray | None) -> None:
         display = self._image_display

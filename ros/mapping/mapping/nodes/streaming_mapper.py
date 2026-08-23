@@ -1657,6 +1657,7 @@ class StreamingMapper(Node):
         means_state = state.get("means")
         object_count = int(getattr(means_state, "shape", [0])[0]) if means_state is not None else 0
         if object_count <= 0:
+            state["object_detection_category"] = []
             state["object_detection_category_conf"] = []
             return
 
@@ -1716,6 +1717,7 @@ class StreamingMapper(Node):
         det_winner_list = self._to_plain_list(det_idx)
         if not det_winner_list:
             state["object_detection_category_conf"] = det_list
+            self._sync_detection_categories(det_list)
             return
 
         scores_list = self._to_plain_list(seg_outputs.get("scores"))
@@ -1764,6 +1766,19 @@ class StreamingMapper(Node):
                 obj_map[category] = float(score)
 
         state["object_detection_category_conf"] = det_list
+        self._sync_detection_categories(det_list)
+
+    def _sync_detection_categories(self, det_list: Sequence[Dict[str, float]]) -> None:
+        """Persist the detector winner without modifying VLM-owned semantics."""
+        state = self._scene_state
+        detected: List[str] = []
+        for entry in det_list:
+            best = ""
+            if isinstance(entry, dict) and entry:
+                with contextlib.suppress(Exception):
+                    best = str(max(entry.items(), key=lambda item: float(item[1]))[0]).strip()
+            detected.append(best)
+        state["object_detection_category"] = detected
 
     # _build_local_caption_* methods extracted to lib.captioning.
 

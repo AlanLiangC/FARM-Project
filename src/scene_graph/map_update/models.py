@@ -41,10 +41,14 @@ class SceneState(TypedDict, total=False):
     object_qwen3_vl_embedding_history: List[List[list]]
 
     # -- Categories & attributes --
+    # Final semantics produced by the caption/VLM stage.
     object_category: List[str]
     object_supercategory: List[str]
     object_category_candidates: List[List[str]]
     object_key_attributes: List[List[str]]
+    # Detector-only semantics.  The singular field is derived from the
+    # highest-confidence entry in the official confidence mapping.
+    object_detection_category: List[str]
     object_detection_category_conf: List[Dict[str, float]]
 
     # -- High-quality captioning --
@@ -139,6 +143,7 @@ def initialize_scene_graph_state(
         "caption_results_empty_total": 0,
         "caption_results_keep_total": 0,
         "caption_results_drop_total": 0,
+        "object_detection_category": [],
         "object_detection_category_conf": [],
         "active": _zeros((0,), torch.bool),
         "object_id": torch.zeros((0,), dtype=torch.int64),

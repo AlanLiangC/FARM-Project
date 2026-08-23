@@ -45,6 +45,7 @@ def slim_scene_state_for_viser(scene_state: dict[str, Any]) -> dict[str, Any]:
         "object_caption",
         "object_caption_decision",
         "object_category",
+        "object_detection_category",
         "object_supercategory",
         "object_key_attributes",
         "object_detection_category_conf",
@@ -55,6 +56,9 @@ def slim_scene_state_for_viser(scene_state: dict[str, Any]) -> dict[str, Any]:
         "region_centroids",
         "region_label_confidence",
         "object_image_ids",
+        "viewpoint_image_ids",
+        "object_mask_observations",
+        "images",
     )
 
     out: dict[str, Any] = {}

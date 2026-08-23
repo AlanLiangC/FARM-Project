@@ -28,7 +28,9 @@ def declare_mapper_parameters(node: Node) -> None:
     # DINO merge backbone: auto-prefer the gated ViT-S+/16 (paper backbone, more
     # stable merging) when a local copy is present, else fall back to the
     # non-gated ViT-S/16 checked in by bootstrap_models.sh (offline-safe).
-    default_dino_model, default_dino_weights_path = resolve_dino_backbone()
+    # The final value may be supplied by ROS --extra-param, so do not warn
+    # about this provisional default before overrides have been applied.
+    default_dino_model, default_dino_weights_path = resolve_dino_backbone(warn_if_fallback=False)
     default_dino_weights = str(default_dino_weights_path or "")
 
     node.declare_parameter("logger_level", "INFO")

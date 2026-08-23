@@ -142,7 +142,7 @@ def find_model_dir(dirname: str, *subdirs: str) -> Optional[Path]:
     return None
 
 
-def resolve_dino_backbone() -> tuple[str, Optional[str]]:
+def resolve_dino_backbone(*, warn_if_fallback: bool = True) -> tuple[str, Optional[str]]:
     """Choose the DINOv3 object-merge backbone, auto-preferring ViT-S+/16.
 
     Prefers ``dinov3-vits16plus`` (the paper backbone — tighter, more stable
@@ -160,7 +160,7 @@ def resolve_dino_backbone() -> tuple[str, Optional[str]]:
         return DINOV3_VITS16PLUS_MODEL, str(plus)
     base = find_model_dir("dinov3-vits16") or find_model_dir("dinov3-vits16", "models")
     if base is not None:
-        if not _DINO_FALLBACK_WARNED:
+        if warn_if_fallback and not _DINO_FALLBACK_WARNED:
             _DINO_FALLBACK_WARNED = True
             _LOGGER.warning(
                 "DINO merge backbone: dinov3-vits16plus not found; falling back to the "
