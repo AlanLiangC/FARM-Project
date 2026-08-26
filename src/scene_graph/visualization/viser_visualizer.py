@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -31,6 +32,7 @@ except Exception:  # pragma: no cover - viser is optional or may fail to import 
 
 from scene_graph.utils.geometry import decode_voxel_keys_numpy as _decode_voxel_keys
 from scene_graph.utils.geometry import voxel_cloud_aabb as _voxel_cloud_aabb
+from scene_graph.utils.geometry import VOXEL_BASE_V
 from scene_graph.map_update.mask_observations import load_mask_observation
 
 
@@ -44,6 +46,86 @@ def _to_numpy(array) -> np.ndarray:
     if isinstance(array, torch.Tensor):
         return array.detach().cpu().numpy()
     return np.asarray(array)
+
+
+def _rotation_matrix_to_wxyz(rotation: np.ndarray) -> np.ndarray:
+    """Convert a proper 3x3 rotation matrix to a normalized wxyz quaternion."""
+    matrix = np.asarray(rotation, dtype=np.float64).reshape(3, 3)
+    trace = float(np.trace(matrix))
+    if trace > 0.0:
+        scale = math.sqrt(trace + 1.0) * 2.0
+        quat = np.asarray(
+            [0.25 * scale, (matrix[2, 1] - matrix[1, 2]) / scale,
+             (matrix[0, 2] - matrix[2, 0]) / scale, (matrix[1, 0] - matrix[0, 1]) / scale]
+        )
+    else:
+        axis = int(np.argmax(np.diag(matrix)))
+        if axis == 0:
+            scale = math.sqrt(max(1.0e-12, 1.0 + matrix[0, 0] - matrix[1, 1] - matrix[2, 2])) * 2.0
+            quat = np.asarray([(matrix[2, 1] - matrix[1, 2]) / scale, 0.25 * scale,
+                               (matrix[0, 1] + matrix[1, 0]) / scale, (matrix[0, 2] + matrix[2, 0]) / scale])
+        elif axis == 1:
+            scale = math.sqrt(max(1.0e-12, 1.0 + matrix[1, 1] - matrix[0, 0] - matrix[2, 2])) * 2.0
+            quat = np.asarray([(matrix[0, 2] - matrix[2, 0]) / scale,
+                               (matrix[0, 1] + matrix[1, 0]) / scale, 0.25 * scale,
+                               (matrix[1, 2] + matrix[2, 1]) / scale])
+        else:
+            scale = math.sqrt(max(1.0e-12, 1.0 + matrix[2, 2] - matrix[0, 0] - matrix[1, 1])) * 2.0
+            quat = np.asarray([(matrix[1, 0] - matrix[0, 1]) / scale,
+                               (matrix[0, 2] + matrix[2, 0]) / scale,
+                               (matrix[1, 2] + matrix[2, 1]) / scale, 0.25 * scale])
+    return (quat / max(float(np.linalg.norm(quat)), 1.0e-12)).astype(np.float32)
+
+
+def _gravity_constrained_obb(
+    points: np.ndarray,
+    up_direction: np.ndarray,
+    fallback_horizontal: np.ndarray | None = None,
+    *,
+    padding: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Fit an OBB that stays vertical and estimates only horizontal yaw."""
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    pts = pts[np.isfinite(pts).all(axis=1)]
+    if pts.shape[0] < 3:
+        return None
+    up = np.asarray(up_direction, dtype=np.float64).reshape(3)
+    up /= max(float(np.linalg.norm(up)), 1.0e-12)
+    horizontal = None
+    if fallback_horizontal is not None:
+        candidate = np.asarray(fallback_horizontal, dtype=np.float64).reshape(3)
+        candidate -= up * float(np.dot(candidate, up))
+        if np.isfinite(candidate).all() and float(np.linalg.norm(candidate)) > 1.0e-8:
+            horizontal = candidate / float(np.linalg.norm(candidate))
+    if horizontal is None:
+        seed = np.eye(3)[int(np.argmin(np.abs(up)))]
+        horizontal = seed - up * float(np.dot(seed, up))
+        horizontal /= max(float(np.linalg.norm(horizontal)), 1.0e-12)
+    lateral = np.cross(up, horizontal)
+    lateral /= max(float(np.linalg.norm(lateral)), 1.0e-12)
+
+    centered = pts - np.mean(pts, axis=0)
+    planar = np.column_stack((centered @ horizontal, centered @ lateral))
+    covariance = planar.T @ planar / max(1, planar.shape[0])
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    if float(eigenvalues[-1]) > 1.05 * max(float(eigenvalues[0]), 1.0e-12):
+        principal = eigenvectors[:, -1]
+        axis_x = principal[0] * horizontal + principal[1] * lateral
+        axis_x /= max(float(np.linalg.norm(axis_x)), 1.0e-12)
+        if float(np.dot(axis_x, horizontal)) < 0.0:
+            axis_x = -axis_x
+    else:
+        axis_x = horizontal
+    axis_y = np.cross(up, axis_x)
+    axis_y /= max(float(np.linalg.norm(axis_y)), 1.0e-12)
+    basis = np.column_stack((axis_x, axis_y, up))
+    local = pts @ basis
+    half_padding = max(0.0, float(padding)) * 0.5
+    minimum = local.min(axis=0) - half_padding
+    maximum = local.max(axis=0) + half_padding
+    dimensions = np.maximum(maximum - minimum, 0.08)
+    center = (0.5 * (minimum + maximum)) @ basis.T
+    return center.astype(np.float32), dimensions.astype(np.float32), _rotation_matrix_to_wxyz(basis)
 
 
 def _cholesky_with_jitter(
@@ -249,6 +331,11 @@ class PipelineViserVisualizer:
         self._server = None
         self._latest_client = None
         self._home_camera: tuple[np.ndarray, np.ndarray] | None = None
+        self._home_up_direction: np.ndarray | None = None
+        self._object_box_up_direction: np.ndarray | None = None
+        self._object_box_forward_direction: np.ndarray | None = None
+        self._background_point_handles: list[object] = []
+        self._point_size_slider = None
         self._query_examples_dropdown = None
         self._query_examples_ready = False
         self._query_examples_override = [
@@ -301,6 +388,7 @@ class PipelineViserVisualizer:
         self._retrieval_ready: bool = False
         self._retrieval_procs: Dict[str, subprocess.Popen] = {}
         self._retrieval_proc_logs: Dict[str, str] = {}
+        self._retrieval_launch_errors: Dict[str, str] = {}
         self._retrieval_lock = threading.Lock()
         self._retrieval_embedder = None  # scene_graph.llm_utils.EmbedInterface (lazy)
         self._retrieval_llm = None       # scene_graph.llm_utils.LLMInterface (lazy)
@@ -391,7 +479,11 @@ class PipelineViserVisualizer:
                     threading.Thread(
                         target=self._try_set_camera,
                         args=(client,),
-                        kwargs={"position": home[0], "look_at": home[1]},
+                        kwargs={
+                            "position": home[0],
+                            "look_at": home[1],
+                            "up_direction": self._home_up_direction,
+                        },
                         daemon=True,
                     ).start()
 
@@ -400,6 +492,7 @@ class PipelineViserVisualizer:
             self._enabled = False
             return
 
+        self._setup_display_gui()
         self._setup_filter_gui()
         self._setup_query_gui()
         self._setup_edit_gui()
@@ -492,9 +585,14 @@ class PipelineViserVisualizer:
             cols = None
         if cols is None:
             cols = np.full((pts.shape[0], 3), 0.55, dtype=np.float32)
-        self._server.scene.add_point_cloud(
+        handle = self._server.scene.add_point_cloud(
             name, points=pts, colors=cols, point_size=max(1.0e-4, float(point_size))
         )
+        self._background_point_handles.append(handle)
+        self._point_size = max(1.0e-4, float(point_size))
+        if self._point_size_slider is not None:
+            with contextlib.suppress(Exception):
+                self._point_size_slider.value = self._point_size
         self._server.flush()
 
     def add_trajectory(self, poses: np.ndarray | None, *, name: str = "/trajectory", axes_length: float = 0.15, axes_radius: float = 0.008) -> None:
@@ -526,13 +624,19 @@ class PipelineViserVisualizer:
             )
             self._server.flush()
 
-    def set_home_view(self, points: np.ndarray | None) -> None:
+    def set_home_view(
+        self,
+        points: np.ndarray | None,
+        *,
+        up_direction: Sequence[float] | np.ndarray | None = None,
+        view_direction: Sequence[float] | np.ndarray | None = None,
+    ) -> None:
         """Frame *points* (Nx3) with an elevated 3/4 overview camera.
 
         Applied to already-connected clients and to every client that connects
         later, so a saved scene opens showing the whole scene instead of the
-        viser default near the origin. The vertical axis is inferred as the
-        AABB's smallest extent — scans are much wider than they are tall.
+        viser default near the origin. Prefer explicit camera up/view vectors;
+        otherwise infer the vertical axis from the AABB's smallest extent.
         """
         if points is None or self._server is None:
             return
@@ -544,19 +648,51 @@ class PipelineViserVisualizer:
         mins, maxs = np.percentile(pts, 2.0, axis=0), np.percentile(pts, 98.0, axis=0)
         center = (mins + maxs) / 2.0
         extent = maxs - mins
-        up_axis = int(np.argmin(extent))
-        horiz = [i for i in range(3) if i != up_axis]
         dist = max(float(np.linalg.norm(extent)) * 0.55, 2.0)
-        offset = np.zeros(3)
-        offset[horiz[0]] = 0.50 * dist
-        offset[horiz[1]] = -0.40 * dist
-        offset[up_axis] = 0.70 * dist
+        up = None
+        if up_direction is not None:
+            with contextlib.suppress(Exception):
+                candidate = np.asarray(up_direction, dtype=np.float64).reshape(3)
+                norm = float(np.linalg.norm(candidate))
+                if np.isfinite(candidate).all() and norm > 1.0e-8:
+                    up = candidate / norm
+        forward = None
+        if view_direction is not None and up is not None:
+            with contextlib.suppress(Exception):
+                candidate = np.asarray(view_direction, dtype=np.float64).reshape(3)
+                candidate = candidate - up * float(np.dot(candidate, up))
+                norm = float(np.linalg.norm(candidate))
+                if np.isfinite(candidate).all() and norm > 1.0e-8:
+                    forward = candidate / norm
+        if up is not None and forward is not None:
+            right = np.cross(forward, up)
+            right /= max(float(np.linalg.norm(right)), 1.0e-8)
+            offset = -0.75 * dist * forward + 0.25 * dist * right + 0.35 * dist * up
+        else:
+            up_axis = int(np.argmin(extent))
+            horiz = [i for i in range(3) if i != up_axis]
+            offset = np.zeros(3)
+            offset[horiz[0]] = 0.50 * dist
+            offset[horiz[1]] = -0.40 * dist
+            offset[up_axis] = 0.70 * dist
+            up = np.zeros(3)
+            up[up_axis] = 1.0
+        self._object_box_up_direction = np.asarray(up, dtype=np.float32)
+        self._object_box_forward_direction = (
+            None if forward is None else np.asarray(forward, dtype=np.float32)
+        )
+        self._home_up_direction = np.asarray(up, dtype=np.float32)
         self._home_camera = ((center + offset).astype(np.float32), center.astype(np.float32))
         clients: dict = {}
         with contextlib.suppress(Exception):
             clients = self._server.get_clients()
         for client in clients.values():
-            self._try_set_camera(client, position=self._home_camera[0], look_at=self._home_camera[1])
+            self._try_set_camera(
+                client,
+                position=self._home_camera[0],
+                look_at=self._home_camera[1],
+                up_direction=self._home_up_direction,
+            )
 
     def set_view_depth_clip(
         self,
@@ -1154,6 +1290,17 @@ class PipelineViserVisualizer:
         def _enabled(name: str, default: bool) -> bool:
             return str(os.getenv(name, "1" if default else "0")).strip().lower() not in {"0", "false", "no", "off"}
 
+        def _gpu_memory(name: str, default: float) -> str:
+            raw = os.getenv(name, str(default))
+            try:
+                value = float(raw)
+                if not 0.0 < value <= 1.0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                LOGGER.warning("Invalid %s=%r; using %.2f", name, raw, default)
+                value = default
+            return f"{value:g}"
+
         return [
             {
                 "name": "llm (Qwen3.5-9B, query parsing)",
@@ -1162,9 +1309,11 @@ class PipelineViserVisualizer:
                 "hf_ckpt": os.getenv("VLLM_LLM_HF_CKPT", "Qwen/Qwen3.5-9B"),
                 "served": os.getenv("VLLM_MODEL", "qwen3.5-9b"),
                 "gpu": os.getenv("VISER_RETRIEVAL_LLM_GPU", ""),
-                "args": ["--max-model-len", "3084", "--gpu-memory-utilization", "0.75", "--dtype", "half",
+                "args": ["--max-model-len", "3084", "--gpu-memory-utilization",
+                         _gpu_memory("VISER_RETRIEVAL_LLM_GPU_MEMORY_UTILIZATION", 0.75), "--dtype", "half",
                          "--max-num-seqs", "5", "--max-num-batched-tokens", "2048", "--enable-chunked-prefill",
-                         "--reasoning-parser", "qwen3", "--disable-log-stats"],
+                         "--reasoning-parser", "qwen3", "--mm-processor-cache-gb", "0",
+                         "--skip-mm-profiling", "--disable-log-stats"],
             },
             {
                 "name": "embed (Qwen3-Embedding-0.6B, caption channel)",
@@ -1174,7 +1323,9 @@ class PipelineViserVisualizer:
                 "served": os.getenv("VLLM_EMBED_MODEL", "qwen3-emb-0.6b"),
                 "gpu": os.getenv("VISER_RETRIEVAL_EMBED_GPU", ""),
                 "args": ["--runner", "pooling", "--dtype", "half", "--max-model-len", "512",
-                         "--gpu-memory-utilization", "0.2", "--max-num-seqs", "5",
+                         "--gpu-memory-utilization",
+                         _gpu_memory("VISER_RETRIEVAL_EMBED_GPU_MEMORY_UTILIZATION", 0.2),
+                         "--max-num-seqs", "5",
                          "--max-num-batched-tokens", "2048", "--enforce-eager", "--disable-log-stats"],
             },
             {
@@ -1185,10 +1336,38 @@ class PipelineViserVisualizer:
                 "served": os.getenv("VLLM_QWEN3_VL_EMBED_MODEL", "qwen3-vl-emb-2b"),
                 "gpu": os.getenv("VISER_RETRIEVAL_VL_GPU", ""),
                 "args": ["--runner", "pooling", "--dtype", "half", "--max-model-len", "600",
-                         "--gpu-memory-utilization", "0.7", "--max-num-seqs", "5",
-                         "--max-num-batched-tokens", "2048", "--enforce-eager", "--disable-log-stats"],
+                         "--gpu-memory-utilization",
+                         _gpu_memory("VISER_RETRIEVAL_VL_GPU_MEMORY_UTILIZATION", 0.7),
+                         "--max-num-seqs", "5",
+                         "--max-num-batched-tokens", "2048", "--limit-mm-per-prompt", '{"image":1,"video":0}',
+                         "--mm-processor-cache-gb", "0", "--skip-mm-profiling", "--enforce-eager",
+                         "--disable-log-stats"],
             },
         ]
+
+    @staticmethod
+    def _vllm_executable() -> str | None:
+        """Resolve the configured vLLM CLI without depending on Viewer PATH."""
+        configured = os.getenv("VLLM_EXECUTABLE", "").strip()
+        if configured:
+            candidate = Path(configured).expanduser()
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate.resolve())
+            return shutil.which(configured)
+        return shutil.which("vllm")
+
+    @staticmethod
+    def _prepare_vllm_env(executable: str, env: dict[str, str]) -> None:
+        """Expose the CUDA toolkit bundled with the isolated vLLM environment."""
+        vllm_root = Path(executable).resolve().parent.parent
+        cuda_candidates = sorted(vllm_root.glob("lib/python*/site-packages/nvidia/cu*/bin/nvcc"))
+        if cuda_candidates:
+            cuda_home = cuda_candidates[-1].parent.parent
+            env.setdefault("CUDA_HOME", str(cuda_home))
+            env["PATH"] = str(cuda_home / "bin") + os.pathsep + env.get("PATH", "")
+        env.setdefault("HF_HUB_OFFLINE", "1")
+        env.setdefault("TRANSFORMERS_OFFLINE", "1")
+        env.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 
     def _start_retrieval_backend(self) -> None:
         """Bring up (or attach to) the vLLM servers for the relational pipeline.
@@ -1198,28 +1377,39 @@ class PipelineViserVisualizer:
         skipped by ``execute_spatial_query`` (graceful degradation).
         """
         specs = [s for s in self._retrieval_server_specs() if s["enabled"]]
+        executable = self._vllm_executable()
         with self._retrieval_lock:
             for spec in specs:
                 name = spec["name"]
                 if self._server_reachable(spec["base_url"]):
+                    self._retrieval_launch_errors.pop(name, None)
                     continue
                 proc = self._retrieval_procs.get(name)
                 if proc is not None and proc.poll() is None:
                     continue  # already launching
+                if executable is None:
+                    configured = os.getenv("VLLM_EXECUTABLE", "vllm")
+                    message = f"vLLM executable not found: {configured}"
+                    self._retrieval_launch_errors[name] = message
+                    LOGGER.warning("Failed to launch %s: %s", name, message)
+                    continue
                 port = spec["base_url"].rsplit(":", 1)[-1].split("/")[0]
-                cmd = ["vllm", "serve", spec["hf_ckpt"], "--host", "127.0.0.1", "--port", str(port),
+                cmd = [executable, "serve", spec["hf_ckpt"], "--host", "127.0.0.1", "--port", str(port),
                        "--served-model-name", spec["served"], *spec["args"]]
                 env = dict(os.environ)
+                self._prepare_vllm_env(executable, env)
                 if spec.get("gpu"):
                     env["CUDA_VISIBLE_DEVICES"] = str(spec["gpu"])
                 log_path = f"/tmp/viser_vllm_{port}.log"
                 try:
-                    log_file = open(log_path, "ab")  # noqa: SIM115 - owned by the subprocess
-                    self._retrieval_procs[name] = subprocess.Popen(
-                        cmd, stdout=log_file, stderr=subprocess.STDOUT, env=env
-                    )
+                    with open(log_path, "wb") as log_file:
+                        self._retrieval_procs[name] = subprocess.Popen(
+                            cmd, stdout=log_file, stderr=subprocess.STDOUT, env=env
+                        )
                     self._retrieval_proc_logs[name] = log_path
+                    self._retrieval_launch_errors.pop(name, None)
                 except Exception as exc:
+                    self._retrieval_launch_errors[name] = str(exc)
                     LOGGER.warning("Failed to launch %s: %s", name, exc)
 
         # Poll for readiness outside the lock so the UI stays responsive.
@@ -1230,6 +1420,8 @@ class PipelineViserVisualizer:
                 proc = self._retrieval_procs.get(spec["name"])
                 if ok:
                     statuses.append((spec["name"], "ready"))
+                elif spec["name"] in self._retrieval_launch_errors:
+                    statuses.append((spec["name"], f"failed — {self._retrieval_launch_errors[spec['name']]}"))
                 elif proc is not None and proc.poll() is not None:
                     log_hint = self._retrieval_proc_logs.get(spec["name"])
                     statuses.append((spec["name"], f"exited — see `{log_hint}`" if log_hint else "exited"))
@@ -1505,7 +1697,12 @@ class PipelineViserVisualizer:
             with contextlib.suppress(Exception):
                 clients = self._server.get_clients()
             for client in clients.values():
-                self._try_set_camera(client, position=home[0], look_at=home[1])
+                self._try_set_camera(
+                    client,
+                    position=home[0],
+                    look_at=home[1],
+                    up_direction=self._home_up_direction,
+                )
         self._gui_set_markdown(self._query_results_display, "_View reset._")
 
     def _jump_to_object_id(self, target_id: int) -> None:
@@ -1538,6 +1735,56 @@ class PipelineViserVisualizer:
 
     # ------------------------------------------------------------------
     # Filters
+
+    def _setup_display_gui(self) -> None:
+        if self._server is None:
+            return
+        gui = getattr(self._server, "gui", None)
+        if gui is None:
+            return
+        try:
+            with gui.add_folder("Display"):
+                self._point_size_slider = self._gui_add_slider(
+                    gui,
+                    "Point size (m)",
+                    min_v=0.001,
+                    max_v=0.100,
+                    step=0.001,
+                    initial=float(np.clip(self._point_size, 0.001, 0.100)),
+                )
+        except Exception:
+            return
+        slider = self._point_size_slider
+        if slider is None:
+            return
+        on_update = getattr(slider, "on_update", None)
+        if callable(on_update):
+            with contextlib.suppress(Exception):
+
+                @on_update
+                def _(_event=None):
+                    self._handle_point_size_changed()
+
+    def _handle_point_size_changed(self) -> None:
+        if self._point_size_slider is None:
+            return
+        try:
+            point_size = max(1.0e-4, float(getattr(self._point_size_slider, "value")))
+        except Exception:
+            return
+        self._point_size = point_size
+        for handle in list(self._background_point_handles):
+            try:
+                handle.point_size = point_size
+            except Exception:
+                with contextlib.suppress(ValueError):
+                    self._background_point_handles.remove(handle)
+        if self._point_handle is not None:
+            with contextlib.suppress(Exception):
+                self._point_handle.point_size = point_size
+        if self._server is not None:
+            with contextlib.suppress(Exception):
+                self._server.flush()
 
     def _setup_filter_gui(self) -> None:
         if self._server is None:
@@ -2194,7 +2441,13 @@ class PipelineViserVisualizer:
         return pos, look
 
     @staticmethod
-    def _try_set_camera(client: object, *, position: np.ndarray, look_at: np.ndarray) -> None:
+    def _try_set_camera(
+        client: object,
+        *,
+        position: np.ndarray,
+        look_at: np.ndarray,
+        up_direction: np.ndarray | None = None,
+    ) -> None:
         cam = getattr(client, "camera", None)
         if cam is None:
             return
@@ -2213,6 +2466,10 @@ class PipelineViserVisualizer:
                     cam.look_at = look_at
             elif hasattr(cam, "target"):
                 cam.target = look_at
+        if up_direction is not None:
+            with contextlib.suppress(Exception):
+                if hasattr(cam, "up_direction"):
+                    cam.up_direction = up_direction
 
     def _get_robot_position(
         self,
@@ -2420,12 +2677,16 @@ class PipelineViserVisualizer:
         active_indices_all: np.ndarray,
         fallback_centers: np.ndarray,
         fallback_dimensions: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        rotations = np.tile(
+            np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            (len(fallback_centers), 1),
+        )
         if not self._object_box_from_voxels:
-            return fallback_centers, fallback_dimensions
+            return fallback_centers, fallback_dimensions, rotations
         arrays = self._object_voxel_arrays(scene_state)
         if arrays is None:
-            return fallback_centers, fallback_dimensions
+            return fallback_centers, fallback_dimensions, rotations
         flat, offsets, levels = arrays
         centers = np.asarray(fallback_centers, dtype=np.float32).copy()
         dimensions = np.asarray(fallback_dimensions, dtype=np.float32).copy()
@@ -2438,12 +2699,28 @@ class PipelineViserVisualizer:
             end = int(offsets[obj_idx + 1])
             if start < 0 or end > flat.shape[0] or end <= start:
                 continue
+            level = int(levels[obj_idx])
+            if self._object_box_up_direction is not None:
+                points = _decode_voxel_keys(flat[start:end], level)
+                oriented = _gravity_constrained_obb(
+                    points,
+                    self._object_box_up_direction,
+                    self._object_box_forward_direction,
+                    padding=float(VOXEL_BASE_V) * float(1 << level),
+                )
+                if oriented is not None:
+                    center, dims, wxyz = oriented
+                    if np.isfinite(center).all() and np.isfinite(dims).all() and np.isfinite(wxyz).all():
+                        centers[idx] = center
+                        dimensions[idx] = dims
+                        rotations[idx] = wxyz
+                        continue
             box = self._cached_object_voxel_aabb(
                 flat,
                 obj_idx=obj_idx,
                 start=start,
                 end=end,
-                level=int(levels[obj_idx]),
+                level=level,
             )
             if box is None:
                 continue
@@ -2454,7 +2731,7 @@ class PipelineViserVisualizer:
             if np.isfinite(mn).all() and np.isfinite(mx).all() and np.isfinite(dims).all():
                 centers[idx] = 0.5 * (mn + mx)
                 dimensions[idx] = dims
-        return centers, dimensions
+        return centers, dimensions, rotations
 
     def _update_gaussians(self, scene_state: dict) -> None:
         if self._server is None:
@@ -2507,7 +2784,7 @@ class PipelineViserVisualizer:
 
         # Metadata preparation
         active_indices_all = np.nonzero(active_mask)[0]
-        box_centers, box_dimensions = self._object_box_geometry_from_voxels(
+        box_centers, box_dimensions, box_rotations = self._object_box_geometry_from_voxels(
             scene_state,
             active_indices_all=active_indices_all,
             fallback_centers=means_np.astype(np.float32),
@@ -2629,6 +2906,7 @@ class PipelineViserVisualizer:
             is_locked_by_idx,
             is_clear_by_idx,
             dimensions=box_dimensions,
+            rotations_wxyz=box_rotations,
             has_caption_by_idx=has_caption_by_idx,
             visible_by_idx=is_visible_by_idx,
         )
@@ -3443,6 +3721,7 @@ class PipelineViserVisualizer:
         is_locked_by_idx: list[bool] | None = None,
         is_clear_by_idx: list[bool] | None = None,
         dimensions: np.ndarray | None = None,
+        rotations_wxyz: np.ndarray | None = None,
         has_caption_by_idx: list[bool] | None = None,
         visible_by_idx: list[bool] | None = None,
     ) -> None:
@@ -3455,6 +3734,11 @@ class PipelineViserVisualizer:
         default_dimensions = np.array([0.5, 0.5, 0.5], dtype=np.float32)
         if dimensions is None or dimensions.shape != centers.shape:
             dimensions = np.tile(default_dimensions, (len(centers), 1))
+        if rotations_wxyz is None or rotations_wxyz.shape != (len(centers), 4):
+            rotations_wxyz = np.tile(
+                np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+                (len(centers), 1),
+            )
         seen_ids: set[int] = set()
         if is_locked_by_idx is None:
             is_locked_by_idx = [False] * len(ids)
@@ -3519,6 +3803,9 @@ class PipelineViserVisualizer:
                         handle.remove()
                 continue
             dims = np.clip(raw_dims, 0.08, 6.0).astype(np.float32, copy=False)
+            rotation_wxyz = np.asarray(rotations_wxyz[idx], dtype=np.float32)
+            if rotation_wxyz.shape != (4,) or not np.isfinite(rotation_wxyz).all():
+                rotation_wxyz = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
             is_clear = idx >= len(is_clear_by_idx) or bool(is_clear_by_idx[idx])
             if self._hide_unclear_object_boxes and not is_clear:
                 handle = self._object_cube_handles.pop(obj_int, None)
@@ -3569,6 +3856,8 @@ class PipelineViserVisualizer:
                     handle.opacity = opacity
                     if hasattr(handle, "dimensions"):
                         handle.dimensions = dims
+                    if hasattr(handle, "wxyz"):
+                        handle.wxyz = rotation_wxyz
                     with contextlib.suppress(Exception):
                         handle.visible = True  # clear any earlier focus-hide
                     continue
@@ -3587,6 +3876,7 @@ class PipelineViserVisualizer:
                     color=rgb,
                     opacity=opacity,
                     wireframe=False,
+                    wxyz=rotation_wxyz,
                 )
 
                 # Attach Click Listener to the BOX (This works, PointCloud does not)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import time
 from dataclasses import is_dataclass
 from pathlib import Path

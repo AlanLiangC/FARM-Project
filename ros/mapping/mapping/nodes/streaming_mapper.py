@@ -939,7 +939,10 @@ class StreamingMapper(Node):
         sensor_qos = QoSProfile(
             depth=queue_depth_param,
             history=HistoryPolicy.KEEP_LAST,
-            reliability=ReliabilityPolicy.BEST_EFFORT,
+            # RGBDFrame contains both full-resolution images. Reliable QoS is
+            # required for fragmented local samples on hosts whose UDP receive
+            # buffer is smaller than one composite frame.
+            reliability=ReliabilityPolicy.RELIABLE,
         )
 
         # Per-camera throttling is no longer used; keep a guard for optional re-introduction.

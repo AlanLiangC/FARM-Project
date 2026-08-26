@@ -29,6 +29,7 @@ this machine) or run ``./run.sh vllm`` first / point ``VLLM_BASE_URL`` +
 from __future__ import annotations
 
 import argparse
+import json
 import time
 from pathlib import Path
 
@@ -111,6 +112,28 @@ def load_cloud(cloud_path: Path, max_points: int) -> tuple[np.ndarray, np.ndarra
     return pts, cols
 
 
+def load_declared_world_up(frames_dir: Path | None) -> np.ndarray | None:
+    """Return the dataset's declared gravity axis after structural leveling."""
+    if frames_dir is None:
+        return None
+    frames_path = Path(frames_dir).expanduser() / "frames.json"
+    try:
+        index = json.loads(frames_path.read_text(encoding="utf-8"))
+        depth_source = index.get("depth_source")
+        if not isinstance(depth_source, dict):
+            return None
+        report = depth_source.get("structural_gravity_alignment")
+        if not isinstance(report, dict) or not bool(report.get("enabled")):
+            return None
+        target = np.asarray(report.get("target_up", [0.0, 0.0, 1.0]), dtype=np.float64).reshape(3)
+        norm = float(np.linalg.norm(target))
+        if not np.isfinite(target).all() or norm <= 1.0e-8:
+            return None
+        return target / norm
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Serve a saved scene_state.pt in viser (objects, captions, retrieval).",
@@ -176,7 +199,6 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001 - cloud is optional context
             print(f"Skipping background cloud ({exc})")
 
-    visualizer.update(colors=[], depths=[], intrinsics=[], poses=[], scene_state=state)
     poses = []
     for rec in state.get("images") or []:
         pose = _record_field(rec, "pose")
@@ -195,7 +217,25 @@ def main() -> int:
             print(f"Skipping trajectory ({exc})")
     if frame_points is None and isinstance(means, torch.Tensor) and means.numel():
         frame_points = means.detach().cpu().numpy().reshape(-1, 3)
-    visualizer.set_home_view(frame_points)
+    # Structurally leveled DA3 datasets already declare their world gravity
+    # axis. Camera image-up is not gravity when the reference frame is pitched;
+    # using it would tilt every object box relative to the leveled cloud.
+    reference_pose = poses[len(poses) // 2] if poses else None
+    declared_up = load_declared_world_up(Path(frames_dir)) if frames_dir is not None else None
+    if declared_up is not None:
+        print(f"Using structurally aligned world up: {declared_up.tolist()}")
+    elif reference_pose is not None:
+        print("No structural gravity metadata; using reference-camera up")
+    visualizer.set_home_view(
+        frame_points,
+        up_direction=declared_up if declared_up is not None else (
+            None if reference_pose is None else -reference_pose[:3, 1]
+        ),
+        view_direction=None if reference_pose is None else reference_pose[:3, 2],
+    )
+    # set_home_view also establishes the gravity-constrained OBB frame, so it
+    # must run before object boxes are materialized.
+    visualizer.update(colors=[], depths=[], intrinsics=[], poses=[], scene_state=state)
     print(f"Serving on http://localhost:{args.port} — Ctrl+C to stop.")
     try:
         while True:
