@@ -104,12 +104,25 @@ def update_viser_visualization(
     neighbors: Sequence[torch.Tensor],
     names: Sequence[str] | None,
     existing_rgb_observations: list[Any] | None = None,
+    frame_index: int | None = None,
+    timestamp_ns: int | None = None,
 ) -> list[Any]:
     """Prepare payloads and update the viser visualizer."""
     num_detections = len(seg_outputs.get("means", []))
     means = seg_outputs.get("means")
     cov6 = seg_outputs.get("cov6")
     if means is None or cov6 is None:
+        viser_visualizer.update(
+            colors,
+            depths,
+            intrinsics_batch,
+            poses_world,
+            scene_state,
+            detection_info=None,
+            detection_neighbors=None,
+            frame_index=frame_index,
+            timestamp_ns=timestamp_ns,
+        )
         return existing_rgb_observations if existing_rgb_observations is not None else [None] * num_detections
 
     detection_rgb_observations = existing_rgb_observations
@@ -153,6 +166,8 @@ def update_viser_visualization(
         scene_state,
         detection_info=detection_payload,
         detection_neighbors=detection_neighbors_vis,
+        frame_index=frame_index,
+        timestamp_ns=timestamp_ns,
     )
 
     return detection_rgb_observations

@@ -831,11 +831,18 @@ class StreamingMapper(Node):
         self._viser_visualizer = (
             PipelineViserVisualizer(
                 enabled=True,
+                voxel_size_m=float(self.get_parameter("viser_voxel_size_m").value),
+                point_size_m=float(self.get_parameter("viser_point_size_m").value),
                 host=str(self.get_parameter("viser_host").value or "127.0.0.1"),
                 port=int(self.get_parameter("viser_port").value),
                 live_rgb_enabled=bool(self.get_parameter("viser_live_rgb_enabled").value),
                 live_rgb_max_side=int(self.get_parameter("viser_live_rgb_max_side").value),
                 live_rgb_max_fps=float(self.get_parameter("viser_live_rgb_max_fps").value),
+                streaming_dashboard_enabled=bool(
+                    self.get_parameter("viser_streaming_dashboard_enabled").value
+                ),
+                stream_total_frames=int(self.get_parameter("viser_stream_total_frames").value),
+                stream_title=str(self.get_parameter("viser_stream_title").value),
                 on_edit_caption=self._viser_edit_caption,
                 on_delete_object=self._viser_delete_object,
                 on_save_all=self._viser_save_all,
@@ -2868,6 +2875,11 @@ class StreamingMapper(Node):
                     neighbors=neighbors,
                     names=getattr(self._segmenter, "names", None),
                     existing_rgb_observations=detection_rgb_observations,
+                    frame_index=self._step_index,
+                    timestamp_ns=max(
+                        (int(frame.get("stamp_ns", 0) or 0) for frame in decoded_batch),
+                        default=0,
+                    ),
                 )
             except Exception as exc:
                 self.get_logger().warn(f"Viser visualization failed: {exc}")

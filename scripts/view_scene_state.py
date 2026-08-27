@@ -147,6 +147,20 @@ def main() -> int:
     parser.add_argument("--point-size", type=float, default=0.02, help="Background cloud point size (m)")
     parser.add_argument("--max-cloud-points", type=int, default=2_000_000, help="Random-subsample the background cloud to this many points (0 = keep all)")
     parser.add_argument("--voxel-points-per-object", type=int, default=0, help="Per-object voxel evidence points to render (0 = clean default: boxes + cloud + trajectory only)")
+    parser.add_argument(
+        "--replay",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Add pseudo-live reconstruction playback when --frames-dir is available.",
+    )
+    parser.add_argument("--replay-fps", type=float, default=5.0, help="Base playback frame rate")
+    parser.add_argument(
+        "--replay-voxel-size",
+        type=float,
+        default=0.02,
+        help="Voxel size used while accumulating replay RGB-D point clouds (m)",
+    )
+    parser.add_argument("--max-replay-frames", type=int, default=0, help="Limit replay frames (0 = all)")
     parser.add_argument("--query-examples", type=Path, default=None, help="Text file with one query per line for the Query panel's Examples dropdown (default: derive examples from the scene's own captioned objects)")
     args = parser.parse_args()
 
@@ -171,12 +185,21 @@ def main() -> int:
         query_examples = [ln.strip() for ln in lines if ln.strip() and not ln.lstrip().startswith("#")]
         print(f"Loaded {len(query_examples)} query examples from {args.query_examples}")
 
+    replay_enabled = bool(args.replay and frames_dir is not None and (Path(frames_dir) / "frames.json").is_file())
     visualizer = PipelineViserVisualizer(
         enabled=True,
+        voxel_size_m=max(0.0, float(args.replay_voxel_size)),
+        # Use the same rendered point diameter for the reconstructed replay and
+        # the static full-result cloud, otherwise replay looks artificially sparse.
+        point_size_m=max(1.0e-4, float(args.point_size)),
         host=args.host,
         port=args.port,
         query_examples=query_examples,
-        live_rgb_enabled=False,
+        live_rgb_enabled=replay_enabled,
+        live_rgb_max_side=480,
+        live_rgb_max_fps=max(5.0, float(args.replay_fps)),
+        streaming_dashboard_enabled=replay_enabled,
+        stream_title="Saved scene replay",
         image_pose_axes_enabled=False,
         object_image_connections_enabled=False,
         covisibility_connections_enabled=False,
@@ -236,6 +259,22 @@ def main() -> int:
     # set_home_view also establishes the gravity-constrained OBB frame, so it
     # must run before object boxes are materialized.
     visualizer.update(colors=[], depths=[], intrinsics=[], poses=[], scene_state=state)
+    replay_controller = None
+    if replay_enabled:
+        try:
+            from scene_graph.visualization.viser_replay import attach_frames_json_replay
+
+            replay_controller = attach_frames_json_replay(
+                visualizer,
+                Path(frames_dir),
+                state,
+                playback_fps=max(0.1, float(args.replay_fps)),
+                max_frames=max(0, int(args.max_replay_frames)),
+                title="Saved scene reconstruction",
+            )
+            print(f"Playback controls: {replay_controller.total_frames} frames at {args.replay_fps:g} FPS")
+        except Exception as exc:  # noqa: BLE001 - static scene viewing remains useful
+            print(f"Skipping reconstruction playback ({exc})")
     print(f"Serving on http://localhost:{args.port} — Ctrl+C to stop.")
     try:
         while True:

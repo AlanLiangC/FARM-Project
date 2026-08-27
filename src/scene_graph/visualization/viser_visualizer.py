@@ -220,6 +220,9 @@ class PipelineViserVisualizer:
         live_rgb_enabled: bool = True,
         live_rgb_max_side: int = 320,
         live_rgb_max_fps: float = 5.0,
+        streaming_dashboard_enabled: bool = False,
+        stream_total_frames: int = 0,
+        stream_title: str = "Offline reconstruction",
         object_gaussians_enabled: bool = False,
         object_connections_enabled: bool = False,
         regions_enabled: bool = True,
@@ -258,6 +261,13 @@ class PipelineViserVisualizer:
         self._live_rgb_enabled = bool(live_rgb_enabled)
         self._live_rgb_max_side = max(1, int(live_rgb_max_side))
         self._live_rgb_max_fps = max(0.0, float(live_rgb_max_fps))
+        self._streaming_dashboard_enabled = bool(streaming_dashboard_enabled)
+        self._stream_total_frames = max(0, int(stream_total_frames))
+        self._stream_title = str(stream_title or "Offline reconstruction")
+        self._stream_first_timestamp_ns: int | None = None
+        self._stream_frame_index = -1
+        self._stream_timestamp_ns: int | None = None
+        self._stream_view_mode = "Cinematic chase"
         self._object_gaussians_enabled = bool(object_gaussians_enabled)
         self._object_connections_enabled = bool(object_connections_enabled)
         self._regions_enabled = bool(regions_enabled)
@@ -318,6 +328,10 @@ class PipelineViserVisualizer:
         self._object_voxel_cloud_handle = None
         self._object_voxel_cloud_dim_handle = None
         self._robot_trajectory_handle = None
+        self._stream_frustum_handle = None
+        self._stream_ego_handle = None
+        self._stream_ego_label = None
+        self._stream_grid_handle = None
         self._search_path_handle = None
         self._search_highlight_box_handle = None
         self._search_highlight_edges_handle = None
@@ -335,7 +349,13 @@ class PipelineViserVisualizer:
         self._object_box_up_direction: np.ndarray | None = None
         self._object_box_forward_direction: np.ndarray | None = None
         self._background_point_handles: list[object] = []
+        self._background_trajectory_handles: list[object] = []
         self._point_size_slider = None
+        self._stream_status_display = None
+        self._stream_progress = None
+        self._stream_view_dropdown = None
+        self._stream_pause_checkbox = None
+        self._stream_overview_button = None
         self._query_examples_dropdown = None
         self._query_examples_ready = False
         self._query_examples_override = [
@@ -437,6 +457,31 @@ class PipelineViserVisualizer:
         try:
             self._server = viser.ViserServer(host=self._host, port=self._port)
             self._camera_frame = self._server.scene.add_frame(name="/camera_pose", axes_length=0.25, axes_radius=0.01)
+            if self._streaming_dashboard_enabled:
+                with contextlib.suppress(Exception):
+                    self._stream_grid_handle = self._server.scene.add_grid(
+                        "/reconstruction/grid",
+                        width=20.0,
+                        height=20.0,
+                        plane="xy",
+                        cell_color=(42, 58, 72),
+                        section_color=(40, 210, 235),
+                        cell_size=0.25,
+                        section_size=1.0,
+                        infinite_grid=True,
+                        fade_distance=12.0,
+                        plane_opacity=0.0,
+                    )
+                with contextlib.suppress(Exception):
+                    self._stream_ego_handle = self._server.scene.add_icosphere(
+                        "/reconstruction/ego",
+                        radius=0.07,
+                        subdivisions=2,
+                        scale=(1.45, 0.75, 0.45),
+                        color=(20, 225, 255),
+                        material="toon5",
+                        opacity=0.95,
+                    )
 
             gui = getattr(self._server, "gui", None)
             if gui is not None:
@@ -453,6 +498,8 @@ class PipelineViserVisualizer:
                     except Exception:
                         self._live_rgb_caption = None
                         self._live_rgb_display = None
+                if self._streaming_dashboard_enabled:
+                    self._setup_streaming_dashboard_gui(gui)
                 try:
                     with gui.add_folder("Last clicked object"):
                         self._caption_display = gui.add_markdown("No object selected yet.")
@@ -514,6 +561,8 @@ class PipelineViserVisualizer:
         scene_state: dict,
         detection_info: dict | None = None,
         detection_neighbors: Sequence[Sequence[int]] | None = None,
+        frame_index: int | None = None,
+        timestamp_ns: int | None = None,
     ) -> None:
         """Render the current batch + active objects."""
 
@@ -532,6 +581,16 @@ class PipelineViserVisualizer:
             self._integrate_points(colors, depths, intrinsics, poses)
             self._update_camera_pose(poses[-1] if len(poses) > 0 else None)
             self._update_robot_trajectory(poses, scene_state)
+            if self._streaming_dashboard_enabled:
+                self._update_streaming_dashboard(
+                    colors,
+                    intrinsics,
+                    poses[-1] if len(poses) > 0 else None,
+                    scene_state,
+                    detection_info,
+                    frame_index=frame_index,
+                    timestamp_ns=timestamp_ns,
+                )
             if self._image_pose_axes_enabled:
                 self._update_image_poses(scene_state)
             else:
@@ -615,13 +674,14 @@ class PipelineViserVisualizer:
         if wxyzs is None or wxyzs.shape[0] != positions.shape[0]:
             wxyzs = np.tile(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32), (positions.shape[0], 1))
         with contextlib.suppress(Exception):
-            self._server.scene.add_batched_axes(
+            handle = self._server.scene.add_batched_axes(
                 name,
                 batched_wxyzs=wxyzs,
                 batched_positions=positions,
                 axes_length=float(axes_length),
                 axes_radius=float(axes_radius),
             )
+            self._background_trajectory_handles.append(handle)
             self._server.flush()
 
     def set_home_view(
@@ -779,7 +839,7 @@ class PipelineViserVisualizer:
     # ------------------------------------------------------------------
     # Point cloud integration
     # ------------------------------------------------------------------
-    def _integrate_points(self, colors, depths, intrinsics, poses) -> None:
+    def _integrate_points(self, colors, depths, intrinsics, poses, *, render: bool = True) -> None:
         new_pc = self._build_point_cloud(colors, depths, intrinsics, poses)
         if new_pc.points.size == 0:
             return
@@ -819,6 +879,8 @@ class PipelineViserVisualizer:
 
         self._accum_points = points
         self._accum_colors = colors_np
+        if not render:
+            return
         display_points = points
         display_colors = colors_np
         keep_mask = self._view_depth_keep_mask(display_points) & self._point_distance_keep_mask(display_points)
@@ -841,6 +903,70 @@ class PipelineViserVisualizer:
             point_size=self._point_size,
             point_shape="circle",
         )
+
+    def accumulated_point_cloud(self) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Return a detached copy of the currently accumulated RGB point cloud."""
+
+        points = None if self._accum_points is None else np.asarray(self._accum_points).copy()
+        colors = None if self._accum_colors is None else np.asarray(self._accum_colors).copy()
+        return points, colors
+
+    def set_background_visible(self, visible: bool) -> None:
+        """Show or hide static archive clouds while a reconstruction replay runs."""
+
+        for handle in (*self._background_point_handles, *self._background_trajectory_handles):
+            with contextlib.suppress(Exception):
+                handle.visible = bool(visible)
+
+    def reset_streaming_geometry(self) -> None:
+        """Clear accumulated frame geometry while preserving GUI and object handles."""
+
+        self._accum_points = None
+        self._accum_colors = None
+        self._accum_voxel_keys = None
+        self._robot_trajectory_positions = []
+        self._stream_first_timestamp_ns = None
+        self._stream_timestamp_ns = None
+        self._stream_frame_index = -1
+        for attr in ("_point_handle", "_robot_trajectory_handle", "_stream_frustum_handle"):
+            handle = getattr(self, attr, None)
+            if handle is not None:
+                with contextlib.suppress(Exception):
+                    handle.remove()
+            setattr(self, attr, None)
+
+    def integrate_replay_frame(
+        self,
+        colors: Sequence[torch.Tensor | np.ndarray],
+        depths: Sequence[torch.Tensor | np.ndarray],
+        intrinsics: Sequence[torch.Tensor | np.ndarray],
+        poses: Sequence[torch.Tensor | np.ndarray],
+    ) -> None:
+        """Accumulate one replay frame without publishing an intermediate cloud."""
+
+        self._integrate_points(colors, depths, intrinsics, poses, render=False)
+        for pose in poses:
+            pose_np = np.asarray(_to_numpy(pose), dtype=np.float32)
+            if pose_np.shape != (4, 4) or not np.isfinite(pose_np).all():
+                continue
+            position = pose_np[:3, 3].copy()
+            if self._robot_trajectory_positions:
+                prev = self._robot_trajectory_positions[-1]
+                if float(np.linalg.norm(position - prev)) < self._robot_trajectory_min_step_m:
+                    continue
+            self._robot_trajectory_positions.append(position)
+        if len(self._robot_trajectory_positions) > self._robot_trajectory_max_points:
+            self._robot_trajectory_positions = self._robot_trajectory_positions[
+                -self._robot_trajectory_max_points :
+            ]
+
+    def prepare_replay_controls(self, total_frames: int) -> None:
+        """Repurpose the streaming dashboard for a completed-scene replay."""
+
+        self._stream_total_frames = max(0, int(total_frames))
+        if self._stream_pause_checkbox is not None:
+            with contextlib.suppress(Exception):
+                self._stream_pause_checkbox.visible = False
 
     def _build_point_cloud(self, colors, depths, intrinsics, poses) -> _PointCloud:
         all_points: list[np.ndarray] = []
@@ -1001,6 +1127,219 @@ class PipelineViserVisualizer:
                 self._camera_frame.position = translation
         except Exception:
             pass
+
+    def _setup_streaming_dashboard_gui(self, gui) -> None:
+        try:
+            with gui.add_folder("Reconstruction Stream"):
+                self._stream_status_display = gui.add_markdown(
+                    f"### {self._stream_title}\n\nWaiting for the first reconstructed frame…"
+                )
+                self._stream_progress = gui.add_progress_bar(
+                    0.0,
+                    animated=True,
+                    color=(15, 210, 235),
+                )
+                self._stream_view_dropdown = gui.add_dropdown(
+                    "Camera mode",
+                    ("Cinematic chase", "First person", "Top down", "Free orbit"),
+                    initial_value=self._stream_view_mode,
+                    hint="The live RGB panel remains first-person while this controls the 3D view.",
+                )
+                self._stream_pause_checkbox = gui.add_checkbox(
+                    "Pause reconstruction",
+                    False,
+                    hint="Pause before the next offline frame without terminating the build.",
+                )
+                self._stream_overview_button = gui.add_button(
+                    "Overview",
+                    color="cyan",
+                    hint="Switch to free orbit and frame all accumulated geometry.",
+                )
+        except Exception:
+            return
+
+        if self._stream_view_dropdown is not None:
+            with contextlib.suppress(Exception):
+
+                @self._stream_view_dropdown.on_update
+                def _(_event=None):
+                    self._stream_view_mode = str(self._stream_view_dropdown.value)
+
+        if self._stream_pause_checkbox is not None:
+            with contextlib.suppress(Exception):
+
+                @self._stream_pause_checkbox.on_update
+                def _(_event=None):
+                    if bool(self._stream_pause_checkbox.value):
+                        self._streaming_paused.set()
+                    else:
+                        self._streaming_paused.clear()
+
+        if self._stream_overview_button is not None:
+            with contextlib.suppress(Exception):
+
+                @self._stream_overview_button.on_click
+                def _(event=None):
+                    self._stream_view_mode = "Free orbit"
+                    if self._stream_view_dropdown is not None:
+                        self._stream_view_dropdown.value = self._stream_view_mode
+                    self._set_stream_overview(getattr(event, "client", None))
+
+    def _set_stream_overview(self, client: object | None = None) -> None:
+        if self._server is None or self._accum_points is None or self._accum_points.size == 0:
+            return
+        points = np.asarray(self._accum_points, dtype=np.float32)
+        finite = points[np.isfinite(points).all(axis=1)]
+        if finite.size == 0:
+            return
+        lo = np.percentile(finite, 2.0, axis=0)
+        hi = np.percentile(finite, 98.0, axis=0)
+        center = (lo + hi) * 0.5
+        scale = max(0.5, float(np.linalg.norm(hi - lo)))
+        position = center + np.array([0.55, -0.70, 0.55], dtype=np.float32) * scale
+        targets = [client] if client is not None else list(self._server.get_clients().values())
+        for target in targets:
+            self._try_set_camera(
+                target,
+                position=position,
+                look_at=center,
+                up_direction=np.array([0.0, 0.0, 1.0], dtype=np.float32),
+            )
+
+    def _apply_stream_camera(self, pose_np: np.ndarray) -> None:
+        if self._server is None or self._stream_view_mode == "Free orbit":
+            return
+        rotation = pose_np[:3, :3]
+        position_ego = pose_np[:3, 3]
+        forward = rotation[:, 2]
+        up = -rotation[:, 1]
+        right = rotation[:, 0]
+        if self._stream_view_mode == "First person":
+            position = position_ego + up * 0.025
+            look_at = position_ego + forward * 0.8
+            up_direction = up
+        elif self._stream_view_mode == "Top down":
+            position = position_ego + np.array([0.0, 0.0, 1.5], dtype=np.float32)
+            look_at = position_ego + forward * 0.15
+            up_direction = forward
+        else:
+            position = position_ego - forward * 0.65 + up * 0.30 + right * 0.16
+            look_at = position_ego + forward * 0.45
+            up_direction = up
+        for client in self._server.get_clients().values():
+            self._try_set_camera(
+                client,
+                position=np.asarray(position, dtype=np.float32),
+                look_at=np.asarray(look_at, dtype=np.float32),
+                up_direction=np.asarray(up_direction, dtype=np.float32),
+            )
+
+    def _update_streaming_dashboard(
+        self,
+        colors: Sequence[torch.Tensor | np.ndarray],
+        intrinsics: Sequence[torch.Tensor | np.ndarray],
+        pose: torch.Tensor | np.ndarray | None,
+        scene_state: dict,
+        detection_info: dict | None,
+        *,
+        frame_index: int | None,
+        timestamp_ns: int | None,
+    ) -> None:
+        if self._server is None or pose is None:
+            return
+        pose_np = np.asarray(_to_numpy(pose), dtype=np.float32)
+        if pose_np.shape != (4, 4) or not np.isfinite(pose_np).all():
+            return
+        rotation = pose_np[:3, :3]
+        position = pose_np[:3, 3]
+        quat_wxyz = None
+        if SO3 is not None:
+            with contextlib.suppress(Exception):
+                quat_wxyz = np.asarray(SO3.from_matrix(rotation).wxyz, dtype=np.float32)
+
+        if self._stream_ego_handle is not None:
+            with contextlib.suppress(Exception):
+                self._stream_ego_handle.position = position
+                if quat_wxyz is not None:
+                    self._stream_ego_handle.wxyz = quat_wxyz
+
+        image = self._prepare_live_rgb(colors[-1]) if colors else None
+        K_np = None
+        if intrinsics:
+            with contextlib.suppress(Exception):
+                K_np = np.asarray(_to_numpy(intrinsics[-1]), dtype=np.float32).reshape(3, 3)
+        if image is not None and K_np is not None and quat_wxyz is not None:
+            height, width = image.shape[:2]
+            fy = max(1.0e-6, float(K_np[1, 1]))
+            fov = float(2.0 * np.arctan(height / (2.0 * fy)))
+            if self._stream_frustum_handle is not None:
+                with contextlib.suppress(Exception):
+                    self._stream_frustum_handle.remove()
+            with contextlib.suppress(Exception):
+                self._stream_frustum_handle = self._server.scene.add_camera_frustum(
+                    "/reconstruction/current_camera",
+                    fov=fov,
+                    aspect=float(width / max(1, height)),
+                    scale=0.14,
+                    thickness=2.0,
+                    thickness_units="screen",
+                    color=(20, 230, 255),
+                    image=image,
+                    format="jpeg",
+                    jpeg_quality=82,
+                    wxyz=quat_wxyz,
+                    position=position,
+                )
+
+        self._stream_frame_index = int(frame_index if frame_index is not None else self._stream_frame_index + 1)
+        if timestamp_ns is not None and int(timestamp_ns) > 0:
+            self._stream_timestamp_ns = int(timestamp_ns)
+            if self._stream_first_timestamp_ns is None:
+                self._stream_first_timestamp_ns = int(timestamp_ns)
+        elapsed_s = 0.0
+        if self._stream_timestamp_ns is not None and self._stream_first_timestamp_ns is not None:
+            elapsed_s = max(0.0, (self._stream_timestamp_ns - self._stream_first_timestamp_ns) / 1.0e9)
+        point_count = int(self._accum_points.shape[0]) if self._accum_points is not None else 0
+        active = scene_state.get("active")
+        try:
+            active_count = int(np.count_nonzero(_to_numpy(active))) if active is not None else 0
+        except Exception:
+            active_count = 0
+        detection_count = 0
+        if detection_info is not None:
+            with contextlib.suppress(Exception):
+                detection_count = len(detection_info.get("means", []))
+        current = self._stream_frame_index + 1
+        total_text = str(self._stream_total_frames) if self._stream_total_frames > 0 else "?"
+        self._gui_set_markdown(
+            self._stream_status_display,
+            (
+                f"### {self._stream_title}\n\n"
+                f"`FRAME {current:05d} / {total_text}` · `T+{elapsed_s:07.2f}s`\n\n"
+                f"**{point_count:,}** map points · **{active_count}** active objects · "
+                f"**{detection_count}** detections"
+            ),
+        )
+        if self._stream_progress is not None:
+            with contextlib.suppress(Exception):
+                if self._stream_total_frames > 0:
+                    self._stream_progress.value = float(np.clip(current / self._stream_total_frames, 0.0, 1.0))
+                    self._stream_progress.animated = False
+                else:
+                    self._stream_progress.animated = True
+        if self._stream_ego_label is None:
+            with contextlib.suppress(Exception):
+                self._stream_ego_label = self._server.scene.add_label(
+                    "/reconstruction/ego_label",
+                    text=f"EGO · {current:05d} · {elapsed_s:.2f}s",
+                    position=position + np.array([0.0, 0.0, 0.13], dtype=np.float32),
+                    anchor="bottom-center",
+                )
+        else:
+            with contextlib.suppress(Exception):
+                self._stream_ego_label.position = position + np.array([0.0, 0.0, 0.13], dtype=np.float32)
+                self._stream_ego_label.text = f"EGO · {current:05d} · {elapsed_s:.2f}s"
+        self._apply_stream_camera(pose_np)
 
     @staticmethod
     def _gui_get_value(handle: object | None) -> str:
@@ -2541,7 +2880,11 @@ class PipelineViserVisualizer:
 
         positions = np.stack(self._robot_trajectory_positions, axis=0).astype(np.float32, copy=False)
         segments = np.stack([positions[:-1], positions[1:]], axis=1)
-        colors = np.tile(np.array([255, 0, 0], dtype=np.uint8), (segments.shape[0], 2, 1))
+        phase = np.linspace(0.0, 1.0, segments.shape[0], dtype=np.float32)[:, None]
+        start_color = np.array([20.0, 220.0, 255.0], dtype=np.float32)
+        end_color = np.array([205.0, 70.0, 255.0], dtype=np.float32)
+        gradient = np.clip(start_color + phase * (end_color - start_color), 0, 255).astype(np.uint8)
+        colors = np.repeat(gradient[:, None, :], 2, axis=1)
 
         if self._robot_trajectory_handle is not None:
             with contextlib.suppress(Exception):
@@ -2551,7 +2894,7 @@ class PipelineViserVisualizer:
             name="/robot_trajectory",
             points=segments,
             colors=colors,
-            line_width=4.0,
+            line_width=5.0,
         )
 
     @staticmethod

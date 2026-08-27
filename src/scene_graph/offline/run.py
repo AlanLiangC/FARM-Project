@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import logging
 import os
 import sys
@@ -209,6 +210,18 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--keep-viser-after-run",
         action="store_true",
         help="After the frame source is exhausted, save/drain captions but keep the embedded Viser server alive.",
+    )
+    parser.add_argument(
+        "--viser-replay-fps",
+        type=float,
+        default=5.0,
+        help="Pseudo-live playback rate exposed after a frames-json build completes.",
+    )
+    parser.add_argument(
+        "--viser-ready-marker",
+        type=Path,
+        default=None,
+        help="Write this JSON marker after mapping, save/drain, and replay setup complete.",
     )
     parser.add_argument(
         "--viser-live-rgb",
@@ -433,9 +446,32 @@ def _finalize_before_viser_idle(mapper: object) -> None:
 def _keep_viser_alive(mapper: object, *, host: str, port: int) -> None:
     LOGGER.info("Mapping complete; keeping Viser alive at http://localhost:%d", int(port))
     LOGGER.info("Use Ctrl+C or terminate this process when finished inspecting.")
-    while True:
-        _wait_for_viser_streaming_resume(mapper)
-        time.sleep(1.0)
+    try:
+        while True:
+            _wait_for_viser_streaming_resume(mapper)
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        LOGGER.info("Stopping persistent Viser.")
+
+
+def _release_mapper_inference_resources(mapper: object) -> None:
+    """Free detector/caption GPU resources while retaining the Viser and scene state."""
+
+    caption_manager = getattr(mapper, "_caption_manager", None)
+    if caption_manager is not None:
+        with contextlib.suppress(Exception):
+            caption_manager.shutdown_worker()
+    for attr in ("_segmenter", "_caption_manager", "_worker"):
+        with contextlib.suppress(Exception):
+            setattr(mapper, attr, None)
+    with contextlib.suppress(Exception):
+        import gc
+        import torch
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    LOGGER.info("Released mapper inference resources; persistent Viser remains active.")
 
 
 def _record_viser_snapshot(
@@ -728,6 +764,42 @@ def main(argv: Optional[List[str]] = None) -> int:
             LOGGER.info("Viser replay manifest written: %s", recorder.manifest_path)
         if args.keep_viser_after_run and args.viser:
             _finalize_before_viser_idle(mapper)
+            if args.source == "frames-json" and args.frames_json_dir is not None:
+                try:
+                    from scene_graph.visualization.viser_replay import attach_frames_json_replay
+
+                    controller = attach_frames_json_replay(
+                        mapper._viser_visualizer,
+                        args.frames_json_dir,
+                        mapper._scene_state,
+                        playback_fps=max(0.1, float(args.viser_replay_fps)),
+                        max_frames=max(0, int(args.end)),
+                        title="Offline reconstruction replay",
+                        preserve_accumulated_cloud=True,
+                    )
+                    # Keep an owning reference for the lifetime of the mapper.
+                    mapper._viser_replay_controller = controller
+                    LOGGER.info("Offline reconstruction replay controls are ready.")
+                except Exception as exc:
+                    LOGGER.warning("Failed to enable reconstruction replay: %s", exc)
+            _release_mapper_inference_resources(mapper)
+            if args.viser_ready_marker is not None:
+                marker = args.viser_ready_marker.expanduser()
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                tmp = marker.with_suffix(marker.suffix + ".tmp")
+                tmp.write_text(
+                    json.dumps(
+                        {
+                            "ready": True,
+                            "port": int(args.viser_port),
+                            "frames_json_dir": str(args.frames_json_dir or ""),
+                            "completed_unix_s": time.time(),
+                        },
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                tmp.replace(marker)
             _keep_viser_alive(mapper, host=args.viser_host, port=args.viser_port)
     finally:
         if recorder is not None:
@@ -736,7 +808,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         if mapper is not None:
             # destroy_node() handles caption drain + scene_state save + image worker close.
             mapper.destroy_node()
-        rclpy.shutdown()
+        with contextlib.suppress(Exception):
+            rclpy.shutdown()
     return 0
 
 
