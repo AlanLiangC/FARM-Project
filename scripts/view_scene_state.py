@@ -141,6 +141,7 @@ def main() -> int:
     )
     parser.add_argument("--pt", type=Path, required=True, help="Path to scene_state.pt")
     parser.add_argument("--cloud", type=Path, default=None, help="Optional cloud.npz shown as static background")
+    parser.add_argument("--dynamic-cloud", type=Path, default=None, help="Optional dynamic_4d.npz x,y,z,t object history")
     parser.add_argument("--frames-dir", type=Path, default=None, help="Scene directory with rgb/<camera>/ frames for click-to-inspect anchor views (default: the --cloud directory)")
     parser.add_argument("--host", default="127.0.0.1", help="Interface for the viser server")
     parser.add_argument("--port", type=int, default=8080, help="Port for the viser server")
@@ -221,6 +222,25 @@ def main() -> int:
             frame_points = points
         except Exception as exc:  # noqa: BLE001 - cloud is optional context
             print(f"Skipping background cloud ({exc})")
+    if args.dynamic_cloud is not None:
+        try:
+            with np.load(args.dynamic_cloud.expanduser()) as temporal:
+                dynamic_points = np.asarray(temporal["xyz"], dtype=np.float32).reshape(-1, 3)
+                dynamic_times = np.asarray(temporal["time_s"], dtype=np.float64).reshape(-1)
+            if len(dynamic_points):
+                normalised = (dynamic_times - dynamic_times.min()) / max(1.0e-9, float(np.ptp(dynamic_times)))
+                dynamic_colors = np.column_stack(
+                    (0.15 + 0.85 * normalised, 0.85 - 0.55 * normalised, 1.0 - 0.75 * normalised)
+                ).astype(np.float32)
+                visualizer.add_background_point_cloud(
+                    dynamic_points,
+                    dynamic_colors,
+                    point_size=max(args.point_size * 1.25, 0.004),
+                    name="/dynamic_4d/history",
+                )
+                print(f"Dynamic 4-D history: {len(dynamic_points):,} x,y,z,t samples from {args.dynamic_cloud}")
+        except Exception as exc:
+            print(f"Skipping dynamic 4-D cloud ({exc})")
 
     poses = []
     for rec in state.get("images") or []:

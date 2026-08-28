@@ -144,6 +144,7 @@ from scene_graph.map_update.cannot_link import add_same_frame_cannot_links_from_
 from scene_graph.map_update.get_neighbors import get_neighbors
 from scene_graph.map_update.mask_observations import register_detection_mask_observations
 from scene_graph.map_update.object_update import update_scene_graph_state
+from scene_graph.map_update.temporal import register_temporal_observations
 from scene_graph.map_update.pruning import (
     caption_keywords_criterion,
     compute_indices_to_prune,
@@ -161,7 +162,7 @@ from scene_graph.map_update.models import initialize_scene_graph_state
 from scene_graph.storage.models import ImageRecord
 from scene_graph.utils.geometry import transform_segmentation_to_world
 from scene_graph.scene_state_io import load_scene_state
-from scene_graph.segmentation import DINOFeaturesExtractor, YOLOESegmenter
+from scene_graph.segmentation import DINOFeaturesExtractor, SAM3PrecomputedSegmenter, YOLOESegmenter
 from scene_graph.storage.image_save_worker import (
     ImageSaveWorker,
     mark_image_saved,
@@ -454,23 +455,45 @@ class StreamingMapper(Node):
                 weights_path=str(dino_weights) if dino_weights else None,
                 device=segmenter_device,
             )
-        self._segmenter = YOLOESegmenter(
-            model_id=model_id,
-            vocab_file=vocab_file,
-            imgsz=imgsz,
-            conf_thres=conf_thres,
-            iou_thres=iou_thres,
-            device=segmenter_device,
-            use_dino_features=use_dino,
-            dino_extractor=dino_extractor,
-            mask_erosion_px=mask_erosion_px,
-            mahalanobis_thresh=mahalanobis_thresh,
-            depth_mode_filter_enabled=depth_mode_filter_enabled,
-            depth_mode_k_mad=depth_mode_k_mad,
-            depth_mode_min_mad_m=depth_mode_min_mad_m,
-            vis_segmentation_dir=vis_segmentation_dir,
-            timing_enabled=self._timing_enabled,
-        )
+        segmenter_backend = str(self.get_parameter("segmenter_backend").value or "yoloe").strip().lower()
+        if segmenter_backend == "sam3":
+            sam3_manifest = str(self.get_parameter("segmenter_sam3_manifest").value or "").strip()
+            if not sam3_manifest:
+                raise RuntimeError("segmenter_backend=sam3 requires segmenter_sam3_manifest")
+            if dino_extractor is None:
+                raise RuntimeError("SAM3 backend requires segmenter_use_dino=true")
+            self._segmenter = SAM3PrecomputedSegmenter(
+                sam3_manifest,
+                dino_extractor=dino_extractor,
+                device=segmenter_device,
+                mask_erosion_px=mask_erosion_px,
+                mahalanobis_thresh=mahalanobis_thresh,
+                depth_mode_filter_enabled=depth_mode_filter_enabled,
+                depth_mode_k_mad=depth_mode_k_mad,
+                depth_mode_min_mad_m=depth_mode_min_mad_m,
+                timing_enabled=self._timing_enabled,
+            )
+            ros_logger.info(f"Segmentation backend: SAM3.1 tracks from {sam3_manifest}")
+        elif segmenter_backend == "yoloe":
+            self._segmenter = YOLOESegmenter(
+                model_id=model_id,
+                vocab_file=vocab_file,
+                imgsz=imgsz,
+                conf_thres=conf_thres,
+                iou_thres=iou_thres,
+                device=segmenter_device,
+                use_dino_features=use_dino,
+                dino_extractor=dino_extractor,
+                mask_erosion_px=mask_erosion_px,
+                mahalanobis_thresh=mahalanobis_thresh,
+                depth_mode_filter_enabled=depth_mode_filter_enabled,
+                depth_mode_k_mad=depth_mode_k_mad,
+                depth_mode_min_mad_m=depth_mode_min_mad_m,
+                vis_segmentation_dir=vis_segmentation_dir,
+                timing_enabled=self._timing_enabled,
+            )
+        else:
+            raise RuntimeError(f"unsupported segmenter_backend={segmenter_backend!r}")
 
         self._covisibility_enabled = bool(self.get_parameter("covisibility_enabled").value)
         self._covisibility_max_objects = max(1, int(self.get_parameter("covisibility_max_objects").value))
@@ -2890,6 +2913,12 @@ class StreamingMapper(Node):
         detection_image_ids = compute_detection_image_ids(
             seg_outputs, batch_image_ids, num_detections
         )
+        batch_timestamps_ns = [int(frame.get("stamp_ns", 0) or 0) for frame in decoded_batch]
+        detection_timestamps_ns = []
+        for raw_batch_id in seg_outputs.get("batch_ids", torch.empty(0, dtype=torch.long)).detach().to("cpu", dtype=torch.long).tolist():
+            detection_timestamps_ns.append(
+                batch_timestamps_ns[int(raw_batch_id)] if 0 <= int(raw_batch_id) < len(batch_timestamps_ns) else 0
+            )
         for det_i, image_id in enumerate(detection_image_ids):
             if image_id is None or det_i >= len(detection_rgb_observations):
                 continue
@@ -3064,6 +3093,14 @@ class StreamingMapper(Node):
                         det_to_obj,
                     )
                     update_info["same_frame_cannot_links_added"] = int(n_added)
+                    temporal_added = register_temporal_observations(
+                        self._scene_state,
+                        seg_outputs,
+                        detection_image_ids,
+                        detection_timestamps_ns,
+                        det_to_obj,
+                    )
+                    update_info["temporal_observations_added"] = int(temporal_added)
                     if self._object_mask_saving_enabled and self._object_mask_storage_dir is not None:
                         n_masks = register_detection_mask_observations(
                             self._scene_state,

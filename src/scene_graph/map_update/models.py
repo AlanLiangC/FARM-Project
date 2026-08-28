@@ -62,6 +62,13 @@ class SceneState(TypedDict, total=False):
     object_image_ids: List[List[int]]
     viewpoint_image_ids: List[List[int]]
     object_mask_observations: List[List[Dict[str, Any]]]
+    object_instance_track_ids: List[List[int]]
+    object_temporal_observations: List[List[Dict[str, Any]]]
+    object_time_coverage: List[List[Dict[str, Any]]]
+    object_motion_state: List[Dict[str, Any]]
+    object_current_state: List[Dict[str, Any]]
+    object_location_history: List[List[Dict[str, Any]]]
+    temporal_schema_version: int
     images: List[Any]
     image_positions: List[torch.Tensor]
 
@@ -159,6 +166,13 @@ def initialize_scene_graph_state(
         "object_image_ids": [],
         "viewpoint_image_ids": [],
         "object_mask_observations": [],
+        "object_instance_track_ids": [],
+        "object_temporal_observations": [],
+        "object_time_coverage": [],
+        "object_motion_state": [],
+        "object_current_state": [],
+        "object_location_history": [],
+        "temporal_schema_version": 1,
         "view_means": [],
         "view_cov6": [],
         "images": [],

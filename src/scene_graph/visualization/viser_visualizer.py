@@ -1801,15 +1801,22 @@ class PipelineViserVisualizer:
         """
         from scene_graph.retrieval.spatial_reasoning import execute_spatial_query, parse_query
         from scene_graph.retrieval.spatial_reasoning.models import Predicate, QueryGraph
+        from scene_graph.retrieval.temporal import (
+            format_temporal_evidence,
+            parse_temporal_query,
+            temporal_snapshot,
+        )
 
         state = self._latest_scene_state or {}
         llm = self._retrieval_llm
         embedder = self._retrieval_embedder
+        temporal_request = parse_temporal_query(query, state)
+        spatial_query = temporal_request.cleaned_query or query
 
         # 1. Relational decomposition (needs the LLM; falls back to semantic-only).
         query_graph = None
         with contextlib.suppress(Exception):
-            query_graph = parse_query(query, llm)
+            query_graph = parse_query(spatial_query, llm)
 
         # Retrieval engine: the joint vectorized engine by default (see
         # joint_executor). Set VISER_SPATIAL_METHOD=unified_soft_w50 to run
@@ -1820,14 +1827,14 @@ class PipelineViserVisualizer:
             method = f"spatial (relational, {spatial_method})"
             scored = execute_spatial_query(
                 query_graph, state, llm, embedder,
-                use_vlm=False, pre_filter_k=-1, max_output_candidates=20, raw_query=query,
+                use_vlm=False, pre_filter_k=-1, max_output_candidates=20, raw_query=spatial_query,
                 retrieval_mode="multi", candidate_pool_mode="active",
                 spatial_method=spatial_method, verbose=False,
             )
         else:
             fallback_method = spatial_method if spatial_method == "joint_v1" else "semantic_only"
             method = f"semantic-only ({fallback_method})"
-            target_desc = query_graph.target_description if query_graph is not None else query
+            target_desc = query_graph.target_description if query_graph is not None else spatial_query
             scored = execute_spatial_query(
                 QueryGraph(
                     target_description=target_desc,
@@ -1835,12 +1842,18 @@ class PipelineViserVisualizer:
                     reasoning="semantic-only (no predicates parsed)",
                 ),
                 state, llm, embedder,
-                use_vlm=False, pre_filter_k=-1, max_output_candidates=20, raw_query=query,
+                use_vlm=False, pre_filter_k=-1, max_output_candidates=20, raw_query=spatial_query,
                 retrieval_mode="multi", candidate_pool_mode="active",
                 spatial_method=fallback_method, verbose=False,
             )
 
         scored = sorted(scored, key=lambda c: float(c.composite_score), reverse=True)
+        if temporal_request.mode in {"elapsed", "timestamp", "latest", "earliest"}:
+            scored = [
+                candidate
+                for candidate in scored
+                if temporal_snapshot(state, int(candidate.object_index), temporal_request) is not None
+            ]
         captions = state.get("object_caption") or []
         object_ids_np = None
         with contextlib.suppress(Exception):
@@ -1852,6 +1865,7 @@ class PipelineViserVisualizer:
             oi = int(cand.object_index)
             if 0 <= oi < len(captions) and isinstance(captions[oi], str):
                 cap = captions[oi]
+            cap += format_temporal_evidence(state, oi, temporal_request)
             results.append((int(cand.object_id), float(cand.composite_score), cap))
 
         # Focus set = target + confounders (every scored same-class candidate) +

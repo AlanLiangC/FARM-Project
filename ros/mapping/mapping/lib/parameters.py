@@ -72,6 +72,8 @@ def declare_mapper_parameters(node: Node) -> None:
     node.declare_parameter("segmenter_depth_mode_k_mad", 1.5)
     node.declare_parameter("segmenter_depth_mode_min_mad_m", 0.03)
     node.declare_parameter("segmenter_flush_every_n_messages", 5)
+    node.declare_parameter("segmenter_backend", "yoloe")
+    node.declare_parameter("segmenter_sam3_manifest", "")
 
     node.declare_parameter("lock_initial_scene_state", True)
 

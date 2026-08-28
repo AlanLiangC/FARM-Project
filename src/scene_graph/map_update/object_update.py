@@ -581,6 +581,7 @@ def update_scene_graph_state(
     det_points_offsets: Optional[torch.Tensor] = None,     # (D+1,) int64 CSR
     class_ids_d: Optional[torch.Tensor] = None,             # (D,) semantic class ids
     max_merge_distance_m: Optional[float] = None,
+    trusted_object_merge_pairs: Optional[set[tuple[int, int]]] = None,
 ) -> Dict[str, Any]:
     """
     Update `state` in-place using detections and winner indices.
@@ -985,6 +986,14 @@ def update_scene_graph_state(
                 obj_winner_idx[i] = i
 
     obj_indices = torch.arange(N, device=device)
+    trusted_merge_pairs = {
+        (min(int(first), int(second)), max(int(first), int(second)))
+        for first, second in (trusted_object_merge_pairs or set())
+        if int(first) != int(second)
+    }
+
+    def _trusted_merge(first: int, second: int) -> bool:
+        return (min(int(first), int(second)), max(int(first), int(second))) in trusted_merge_pairs
 
     # Vectorized "refuse far merges" guard: union-find can chain through a
     # large-cov detection and propose a merge between two objects metres
@@ -1003,6 +1012,16 @@ def update_scene_graph_state(
             mu_winner = mu_self[obj_winner_idx]
             merge_dist = (mu_self - mu_winner).norm(dim=1)  # (N,)
             too_far = proposes_merge & (merge_dist > max_merge_distance)
+            if trusted_merge_pairs and bool(too_far.any().item()):
+                trusted_mask = torch.tensor(
+                    [
+                        _trusted_merge(index, int(obj_winner_idx[index].item()))
+                        for index in range(N)
+                    ],
+                    dtype=torch.bool,
+                    device=device,
+                )
+                too_far &= ~trusted_mask
             n_far_merges_blocked = int(too_far.sum().item())
             if n_far_merges_blocked > 0:
                 obj_winner_idx = torch.where(too_far, obj_indices, obj_winner_idx)
@@ -1047,6 +1066,8 @@ def update_scene_graph_state(
             groups.setdefault(winner_idx, []).append(int(i))
         for winner_idx, group in groups.items():
             if len(group) < 2:
+                continue
+            if all(idx == winner_idx or _trusted_merge(idx, winner_idx) for idx in group):
                 continue
             if _voxel_merge_geometry_allowed(
                 voxel_key_lists,
@@ -1236,6 +1257,54 @@ def update_scene_graph_state(
                 if len(winner_masks) > cap:
                     del winner_masks[: len(winner_masks) - cap]
             object_mask_observations[i] = []
+        # Persistent identity and temporal history must follow the canonical
+        # node whenever FARM merges two geometric objects. Dropping these rows
+        # would make a moved/re-discovered object look newly created later.
+        for temporal_key in (
+            "object_instance_track_ids",
+            "object_temporal_observations",
+            "object_time_coverage",
+            "object_location_history",
+        ):
+            temporal_rows = state.get(temporal_key)
+            if not isinstance(temporal_rows, list) or i >= len(temporal_rows):
+                continue
+            while len(temporal_rows) <= winner_idx:
+                temporal_rows.append([])
+            winner_values = temporal_rows[winner_idx] if isinstance(temporal_rows[winner_idx], list) else []
+            loser_values = temporal_rows[i] if isinstance(temporal_rows[i], list) else []
+            combined = list(winner_values)
+            seen = {repr(value) for value in combined}
+            for value in loser_values:
+                marker = repr(value)
+                if marker not in seen:
+                    seen.add(marker)
+                    combined.append(value)
+            if temporal_key in {
+                "object_temporal_observations",
+                "object_time_coverage",
+                "object_location_history",
+            }:
+                combined.sort(
+                    key=lambda value: int(value.get("timestamp_ns", value.get("start_ns", 0)))
+                    if isinstance(value, dict)
+                    else 0
+                )
+            temporal_rows[winner_idx] = combined
+            temporal_rows[i] = []
+        for temporal_key in ("object_current_state", "object_motion_state"):
+            temporal_rows = state.get(temporal_key)
+            if not isinstance(temporal_rows, list) or i >= len(temporal_rows):
+                continue
+            while len(temporal_rows) <= winner_idx:
+                temporal_rows.append({})
+            winner_value = temporal_rows[winner_idx] if isinstance(temporal_rows[winner_idx], dict) else {}
+            loser_value = temporal_rows[i] if isinstance(temporal_rows[i], dict) else {}
+            winner_stamp = int(winner_value.get("timestamp_ns", winner_value.get("last_seen_ns", 0)) or 0)
+            loser_stamp = int(loser_value.get("timestamp_ns", loser_value.get("last_seen_ns", 0)) or 0)
+            if loser_stamp > winner_stamp:
+                temporal_rows[winner_idx] = loser_value
+            temporal_rows[i] = {}
         if i < len(viewpoint_image_ids):
             viewpoint_image_ids[i] = []
         # Ensure view buffers remain bounded and index-aligned after merges.

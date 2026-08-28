@@ -17,6 +17,7 @@ from scene_graph.map_update.filtering import normalize_seg_outputs
 from scene_graph.map_update.get_neighbors import get_neighbors
 from scene_graph.map_update.mask_observations import register_detection_mask_observations
 from scene_graph.map_update.object_update import update_scene_graph_state
+from scene_graph.map_update.temporal import apply_instance_track_correspondence
 from scene_graph.map_update.union_find import find_object_correspondence
 from scene_graph.storage.image_save_worker import ImageSaveWorker, mark_image_saved
 from scene_graph.storage.models import ImageRecord
@@ -253,6 +254,15 @@ def resolve_correspondence(
         cannot_link_pairs=blocked_pairs,
         assignment_mode=assignment_mode,
     )
+    if scene_state is not None:
+        det_idx, n_track_forced = apply_instance_track_correspondence(
+            scene_state,
+            seg_outputs,
+            det_idx,
+            obj_idx,
+            detection_image_ids,
+        )
+        scene_state["_last_instance_track_assignments"] = int(n_track_forced)
     if same_image_one_to_one:
         det_idx, n_forced = enforce_same_image_one_to_one_assignments(
             det_idx,

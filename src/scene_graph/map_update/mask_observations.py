@@ -187,6 +187,7 @@ def register_detection_mask_observations(
     scores = seg_outputs.get("scores")
     class_ids = seg_outputs.get("class_ids")
     batch_ids = seg_outputs.get("batch_ids")
+    instance_track_ids = seg_outputs.get("instance_track_ids")
     object_ids = state.get("object_id")
     n_objects = int(object_ids.shape[0]) if isinstance(object_ids, torch.Tensor) else len(det_to_obj)
     rows = ensure_object_mask_observation_rows(state, n_objects)
@@ -303,6 +304,9 @@ def register_detection_mask_observations(
         batch_id = _int_at(batch_ids, det_i)
         if batch_id is not None:
             record["batch_id"] = int(batch_id)
+        instance_track_id = _int_at(instance_track_ids, det_i)
+        if instance_track_id is not None:
+            record["instance_track_id"] = int(instance_track_id)
 
         row = rows[obj_idx]
         if not isinstance(row, list):
