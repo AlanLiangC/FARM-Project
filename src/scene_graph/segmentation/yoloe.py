@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import hashlib
+import os
 import time
 from collections import OrderedDict
 from collections.abc import Sequence
@@ -191,9 +193,42 @@ class YOLOESegmenter(SegmentationBackend):
         print(f"vocab file path: {self.vocab_file}")
         vocab_names = _load_vocab_list(self.vocab_file)
         self._base_ckpt = _resolve_weights(self.model_id, prompt_free=False)
-        base = YOLOE(str(self._base_ckpt))
-        vocab = base.get_vocab(vocab_names)
-        del base
+        cache_path: Path | None = None
+        cache_root = os.environ.get("YOLOE_VOCAB_CACHE_DIR", "").strip()
+        if cache_root:
+            fingerprint = hashlib.sha256()
+            fingerprint.update(self.model_id.encode())
+            fingerprint.update(self.vocab_file.read_bytes())
+            fingerprint.update(str(self._base_ckpt.stat().st_size).encode())
+            fingerprint.update(str(self._base_ckpt.stat().st_mtime_ns).encode())
+            cache_path = Path(cache_root).expanduser().resolve() / f"{fingerprint.hexdigest()[:20]}.pt"
+        vocab = None
+        if cache_path is not None and cache_path.is_file():
+            try:
+                # This cache is generated locally from the configured YOLOE
+                # checkpoint.  get_vocab() returns a ModuleList of fused
+                # classifier heads, rather than a single embedding tensor.
+                payload = torch.load(cache_path, map_location="cpu", weights_only=False)
+                if payload.get("names") == vocab_names and isinstance(
+                    payload.get("vocab"), torch.nn.ModuleList
+                ):
+                    vocab = payload["vocab"]
+                    LOGGER.info("Loaded YOLOE vocabulary cache: %s", cache_path)
+            except Exception as exc:
+                LOGGER.warning("Ignoring invalid YOLOE vocabulary cache %s: %s", cache_path, exc)
+        if vocab is None:
+            base = YOLOE(str(self._base_ckpt))
+            vocab = base.get_vocab(vocab_names)
+            del base
+            if cache_path is not None and isinstance(vocab, torch.nn.ModuleList):
+                try:
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = cache_path.with_name(f".{cache_path.name}.{os.getpid()}.tmp")
+                    torch.save({"names": vocab_names, "vocab": vocab.cpu()}, temporary)
+                    os.replace(temporary, cache_path)
+                    LOGGER.info("Saved YOLOE vocabulary cache: %s", cache_path)
+                except Exception as exc:
+                    LOGGER.warning("Unable to save YOLOE vocabulary cache %s: %s", cache_path, exc)
         pf_ckpt = _resolve_weights(self.model_id, prompt_free=True)
         model = YOLOE(str(pf_ckpt))
         model.set_vocab(vocab, names=vocab_names)
