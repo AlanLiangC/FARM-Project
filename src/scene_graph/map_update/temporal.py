@@ -190,7 +190,7 @@ def register_temporal_observations(
             "position": means_cpu[detection_index].tolist(),
             "cov6": cov_cpu[detection_index].tolist(),
             "instance_track_id": int(track_id) if track_id is not None else None,
-            "source": "sam3.1" if track_id is not None else "geometry",
+            "source": "instance_tracker" if track_id is not None else "geometry",
         }
         row = observation_rows[object_index]
         if not isinstance(row, list):

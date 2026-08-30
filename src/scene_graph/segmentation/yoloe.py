@@ -8,6 +8,7 @@ from collections import OrderedDict
 from collections.abc import Sequence
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
@@ -20,6 +21,7 @@ from .interfaces import SegmentationBackend
 from .models import SegmentationOutput
 from .dino import DEFAULT_MODEL as DEFAULT_DINO_MODEL
 from .dino import DINOFeaturesExtractor
+from .temporal_tracker import TemporalInstanceTracker, mask_appearance_descriptor
 from .visualization import SegmentationVisualizer
 
 LOGGER = logging.getLogger(__name__)
@@ -74,6 +76,7 @@ class YOLOESegmenter(SegmentationBackend):
         depth_mode_min_mad_m: float = 0.03,
         vis_segmentation_dir: Path | str | None = None,
         timing_enabled: bool = False,
+        track_instances: bool | None = None,
         # debug_save_detections: bool = False,
         # debug_save_protos: bool = False,
         # log_time: bool = False
@@ -105,6 +108,11 @@ class YOLOESegmenter(SegmentationBackend):
         self._mahalanobis_eps = 1e-6
         self._pixel_grid_cache: dict[tuple[int, int, torch.device], tuple[torch.Tensor, torch.Tensor]] = {}
         self._timing_enabled = bool(timing_enabled)
+        if track_instances is None:
+            track_instances = os.environ.get("YOLOE_TEMPORAL_TRACKING", "0").strip().lower() in {
+                "1", "true", "yes", "on",
+            }
+        self._instance_tracker = TemporalInstanceTracker() if track_instances else None
         self.names: list[str] = []
         self.model = self._init_prompt_free_model()
         head = self.model.model.model[-1]
@@ -867,6 +875,69 @@ class YOLOESegmenter(SegmentationBackend):
                 names.append(str(idx))
         return names
 
+    def _assign_temporal_track_ids(
+        self,
+        colors: Sequence[torch.Tensor],
+        masks: torch.Tensor | Sequence[torch.Tensor],
+        boxes: torch.Tensor,
+        labels: Sequence[str],
+        features: torch.Tensor,
+        batch_ids: torch.Tensor,
+        camera_names: Sequence[str],
+    ) -> torch.Tensor | None:
+        """Run the AL-FARM video tracker after YOLOE mask extraction."""
+        tracker = self._instance_tracker
+        if tracker is None:
+            return None
+        count = int(boxes.shape[0])
+        assigned = torch.full((count,), -1, dtype=torch.int64, device=boxes.device)
+        box_rows = boxes.detach().to("cpu", dtype=torch.float32).numpy()
+        feature_rows = features.detach().to("cpu", dtype=torch.float32).numpy()
+        batch_rows = batch_ids.detach().to("cpu", dtype=torch.int64).numpy()
+        mask_rows = list(masks.unbind(0)) if isinstance(masks, torch.Tensor) else list(masks)
+        for batch_index, color in enumerate(colors):
+            indices = np.flatnonzero(batch_rows == batch_index)
+            if not len(indices):
+                # Advance the camera clock even when YOLOE finds no object.
+                tracker.update(
+                    camera_names[batch_index],
+                    np.empty((0, 4), dtype=np.float32),
+                    [],
+                    np.empty((0, 99), dtype=np.float32),
+                )
+                continue
+            image = color.detach().to("cpu")
+            if image.ndim == 4 and image.shape[0] == 1:
+                image = image.squeeze(0)
+            if image.ndim == 3 and image.shape[0] == 3 and image.shape[-1] != 3:
+                image = image.permute(1, 2, 0)
+            image_array = image.numpy()
+            if image_array.dtype != np.uint8:
+                scale = 255.0 if image_array.size and float(np.nanmax(image_array)) <= 1.5 else 1.0
+                image_array = np.clip(np.rint(image_array * scale), 0, 255).astype(np.uint8)
+            descriptors = np.stack(
+                [
+                    mask_appearance_descriptor(
+                        image_array,
+                        mask_rows[int(index)].detach().to("cpu").numpy(),
+                        box_rows[int(index)],
+                    )
+                    for index in indices
+                ],
+                axis=0,
+            )
+            track_ids = tracker.update(
+                camera_names[batch_index],
+                box_rows[indices],
+                [labels[int(index)] for index in indices],
+                descriptors,
+                feature_rows[indices],
+            )
+            assigned[torch.as_tensor(indices, device=assigned.device)] = torch.as_tensor(
+                track_ids, dtype=torch.int64, device=assigned.device
+            )
+        return assigned
+
     def _build_segmentation_outputs(
         self,
         det_per_img: Sequence[int],
@@ -1393,6 +1464,15 @@ class YOLOESegmenter(SegmentationBackend):
                     "Extra Vocab Match": extra_match,
                 })
 
+        instance_track_ids = self._assign_temporal_track_ids(
+            colors,
+            masks,
+            boxes,
+            [str(detection.get("Object Category") or "object") for detection in detections],
+            vis_features,
+            batch_ids,
+            camera_names,
+        )
         out = {
             "batch_ids": batch_ids,  # (M,)
             "boxes_xyxy": boxes,  # (M,4)
@@ -1416,6 +1496,8 @@ class YOLOESegmenter(SegmentationBackend):
             "extra_vocab_matches": extra_vocab_match,
             "timings": timings,
         }
+        if instance_track_ids is not None:
+            out["instance_track_ids"] = instance_track_ids
         if offline_debug:
             out["n_original_pixels"] = n_original_pixels  # (M,) mask pixels before erosion
             out["n_eroded_pixels"] = n_eroded_pixels  # (M,) mask pixels after erosion

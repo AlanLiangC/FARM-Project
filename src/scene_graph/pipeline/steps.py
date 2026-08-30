@@ -384,6 +384,8 @@ def update_state_and_enqueue_captions(
                 det_to_obj,
                 Path(mask_storage_dir),
                 max_per_object=max_mask_observations_per_object,
+                detection_rgb_observations=rgb_observations,
+                save_crops=True,
             )
             update_info["mask_observations_added"] = int(n_masks)
     new_indices = update_info.get("new_object_indices", []) if update_info else []
