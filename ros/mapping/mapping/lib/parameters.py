@@ -75,6 +75,16 @@ def declare_mapper_parameters(node: Node) -> None:
     node.declare_parameter("segmenter_backend", "yoloe")
     node.declare_parameter("segmenter_sam3_manifest", "")
     node.declare_parameter("segmenter_person_track_manifest", "")
+    node.declare_parameter("segmenter_instance_tracker_backend", "botsort_reid")
+    node.declare_parameter("segmenter_tracker_gmc_method", "sparseOptFlow")
+    node.declare_parameter("segmenter_tracker_high_confidence", 0.35)
+    node.declare_parameter("segmenter_tracker_low_confidence", 0.05)
+    node.declare_parameter("segmenter_tracker_buffer_frames", 90)
+    node.declare_parameter("segmenter_tracker_match_threshold", 0.8)
+    node.declare_parameter("segmenter_tracker_proximity_threshold", 0.5)
+    node.declare_parameter("segmenter_tracker_appearance_threshold", 0.25)
+    node.declare_parameter("segmenter_tracker_label_flip_reid_similarity", 0.85)
+    node.declare_parameter("segmenter_person_track_force_ids", False)
 
     node.declare_parameter("lock_initial_scene_state", True)
 

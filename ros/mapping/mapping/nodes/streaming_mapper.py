@@ -444,6 +444,12 @@ class StreamingMapper(Node):
         depth_mode_filter_enabled = bool(self.get_parameter("segmenter_depth_mode_filter_enabled").value)
         depth_mode_k_mad = float(self.get_parameter("segmenter_depth_mode_k_mad").value)
         depth_mode_min_mad_m = float(self.get_parameter("segmenter_depth_mode_min_mad_m").value)
+        instance_tracker_backend = str(
+            self.get_parameter("segmenter_instance_tracker_backend").value or "botsort_reid"
+        ).strip()
+        tracker_gmc_method = str(
+            self.get_parameter("segmenter_tracker_gmc_method").value or "sparseOptFlow"
+        ).strip()
 
         dino_extractor = None
         if use_dino:
@@ -494,7 +500,35 @@ class StreamingMapper(Node):
                 depth_mode_min_mad_m=depth_mode_min_mad_m,
                 vis_segmentation_dir=vis_segmentation_dir,
                 timing_enabled=self._timing_enabled,
+                instance_tracker_backend=instance_tracker_backend,
+                tracker_gmc_method=tracker_gmc_method,
+                tracker_high_confidence=float(
+                    self.get_parameter("segmenter_tracker_high_confidence").value
+                ),
+                tracker_low_confidence=float(
+                    self.get_parameter("segmenter_tracker_low_confidence").value
+                ),
+                tracker_buffer_frames=int(self.get_parameter("segmenter_tracker_buffer_frames").value),
+                tracker_match_threshold=float(
+                    self.get_parameter("segmenter_tracker_match_threshold").value
+                ),
+                tracker_proximity_threshold=float(
+                    self.get_parameter("segmenter_tracker_proximity_threshold").value
+                ),
+                tracker_appearance_threshold=float(
+                    self.get_parameter("segmenter_tracker_appearance_threshold").value
+                ),
+                tracker_label_flip_reid_similarity=float(
+                    self.get_parameter("segmenter_tracker_label_flip_reid_similarity").value
+                ),
                 person_track_manifest=person_track_manifest,
+                person_track_force_ids=bool(
+                    self.get_parameter("segmenter_person_track_force_ids").value
+                ),
+            )
+            ros_logger.info(
+                f"Instance tracking: {instance_tracker_backend}, GMC={tracker_gmc_method}, "
+                f"ReID={'DINOv3' if use_dino else 'disabled'}"
             )
         else:
             raise RuntimeError(f"unsupported segmenter_backend={segmenter_backend!r}")

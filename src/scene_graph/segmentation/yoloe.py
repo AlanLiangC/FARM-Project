@@ -22,7 +22,7 @@ from .interfaces import SegmentationBackend
 from .models import SegmentationOutput
 from .dino import DEFAULT_MODEL as DEFAULT_DINO_MODEL
 from .dino import DINOFeaturesExtractor
-from .temporal_tracker import TemporalInstanceTracker, mask_appearance_descriptor
+from .temporal_tracker import BoTSORTReIDTracker, TemporalInstanceTracker, mask_appearance_descriptor
 from .visualization import SegmentationVisualizer
 
 LOGGER = logging.getLogger(__name__)
@@ -78,7 +78,17 @@ class YOLOESegmenter(SegmentationBackend):
         vis_segmentation_dir: Path | str | None = None,
         timing_enabled: bool = False,
         track_instances: bool | None = None,
+        instance_tracker_backend: str = "botsort_reid",
+        tracker_gmc_method: str = "sparseOptFlow",
+        tracker_high_confidence: float = 0.35,
+        tracker_low_confidence: float = 0.05,
+        tracker_buffer_frames: int = 90,
+        tracker_match_threshold: float = 0.8,
+        tracker_proximity_threshold: float = 0.5,
+        tracker_appearance_threshold: float = 0.25,
+        tracker_label_flip_reid_similarity: float = 0.85,
         person_track_manifest: Path | str | None = None,
+        person_track_force_ids: bool = False,
         # debug_save_detections: bool = False,
         # debug_save_protos: bool = False,
         # log_time: bool = False
@@ -114,7 +124,32 @@ class YOLOESegmenter(SegmentationBackend):
             track_instances = os.environ.get("YOLOE_TEMPORAL_TRACKING", "0").strip().lower() in {
                 "1", "true", "yes", "on",
             }
-        self._instance_tracker = TemporalInstanceTracker() if track_instances else None
+        self._instance_tracker_backend = str(instance_tracker_backend).strip().lower()
+        if track_instances and self._instance_tracker_backend in {"botsort", "botsort_reid"}:
+            if not self._use_dino_features:
+                raise ValueError("BoT-SORT ReID requires use_dino_features=True")
+            self._instance_tracker = BoTSORTReIDTracker(
+                track_high_thresh=tracker_high_confidence,
+                track_low_thresh=tracker_low_confidence,
+                new_track_thresh=tracker_high_confidence,
+                track_buffer=tracker_buffer_frames,
+                match_thresh=tracker_match_threshold,
+                proximity_thresh=tracker_proximity_threshold,
+                appearance_thresh=tracker_appearance_threshold,
+                label_flip_reid_similarity=tracker_label_flip_reid_similarity,
+                gmc_method=tracker_gmc_method,
+            )
+        elif track_instances and self._instance_tracker_backend in {"temporal", "legacy"}:
+            self._instance_tracker = TemporalInstanceTracker(
+                max_dormant_frames=tracker_buffer_frames,
+                high_confidence_threshold=tracker_high_confidence,
+                low_confidence_threshold=tracker_low_confidence,
+            )
+        elif track_instances:
+            raise ValueError(f"unsupported instance tracker backend: {instance_tracker_backend!r}")
+        else:
+            self._instance_tracker = None
+        self._person_track_force_ids = bool(person_track_force_ids)
         self._person_track_manifest = (
             Path(person_track_manifest).expanduser().resolve() if person_track_manifest else None
         )
@@ -981,15 +1016,6 @@ class YOLOESegmenter(SegmentationBackend):
         mask_rows = list(masks.unbind(0)) if isinstance(masks, torch.Tensor) else list(masks)
         for batch_index, color in enumerate(colors):
             indices = np.flatnonzero(batch_rows == batch_index)
-            if not len(indices):
-                # Advance the camera clock even when YOLOE finds no object.
-                tracker.update(
-                    camera_names[batch_index],
-                    np.empty((0, 4), dtype=np.float32),
-                    [],
-                    np.empty((0, 99), dtype=np.float32),
-                )
-                continue
             image = color.detach().to("cpu")
             if image.ndim == 4 and image.shape[0] == 1:
                 image = image.squeeze(0)
@@ -999,6 +1025,19 @@ class YOLOESegmenter(SegmentationBackend):
             if image_array.dtype != np.uint8:
                 scale = 255.0 if image_array.size and float(np.nanmax(image_array)) <= 1.5 else 1.0
                 image_array = np.clip(np.rint(image_array * scale), 0, 255).astype(np.uint8)
+            if not len(indices):
+                # Advance both the Kalman clock and camera-motion estimator
+                # even when YOLOE finds no object in this frame.
+                tracker.update(
+                    camera_names[batch_index],
+                    np.empty((0, 4), dtype=np.float32),
+                    [],
+                    np.empty((0, 99), dtype=np.float32),
+                    np.empty((0, feature_rows.shape[1]), dtype=np.float32),
+                    np.empty((0,), dtype=np.float32),
+                    image=image_array,
+                )
+                continue
             descriptors = np.stack(
                 [
                     mask_appearance_descriptor(
@@ -1017,6 +1056,7 @@ class YOLOESegmenter(SegmentationBackend):
                 descriptors,
                 feature_rows[indices],
                 scores.detach().to("cpu", dtype=torch.float32).numpy()[indices],
+                image=image_array,
             )
             assigned[torch.as_tensor(indices, device=assigned.device)] = torch.as_tensor(
                 track_ids, dtype=torch.int64, device=assigned.device
@@ -1350,8 +1390,15 @@ class YOLOESegmenter(SegmentationBackend):
                 )
                 person_boxes.append(fallback_boxes)
                 person_scores.append(fallback_scores)
-                # Reserve a disjoint ID namespace from YOLOE's online tracker.
-                person_tracks.append(fallback_tracks + 1_000_000)
+                # By default this manifest augments detection recall only. A
+                # single generic BoT-SORT instance then assigns identities to
+                # people and every other class using the same DINO ReID space.
+                # Forced legacy IDs remain available for controlled ablations.
+                person_tracks.append(
+                    fallback_tracks + 1_000_000
+                    if self._person_track_force_ids
+                    else torch.full_like(fallback_tracks, -1)
+                )
                 person_batches.append(
                     torch.full((len(fallback_boxes),), batch_index, dtype=torch.int64, device=self.device)
                 )

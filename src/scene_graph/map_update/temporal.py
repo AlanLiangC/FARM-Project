@@ -103,13 +103,17 @@ def apply_instance_track_correspondence(
             continue
         try:
             for track_id in values:
-                lookup[int(track_id)] = object_index
+                track_id = int(track_id)
+                if track_id >= 0:
+                    lookup[track_id] = object_index
         except TypeError:
             continue
     result = det_idx.clone()
     forced = 0
     rejected_jumps = 0
     for detection_index, track_id in enumerate(detection_tracks[: result.numel()]):
+        if track_id < 0:
+            continue
         object_index = lookup.get(track_id)
         if object_index is None or object_index >= obj_idx.numel():
             continue
@@ -151,7 +155,7 @@ def apply_instance_track_correspondence(
             if int(result[index].item()) >= 0
         }
         for detection_index, track_id in enumerate(detection_tracks[: result.numel()]):
-            if int(result[detection_index].item()) >= 0 or track_id in lookup:
+            if int(result[detection_index].item()) >= 0 or track_id < 0 or track_id in lookup:
                 continue
             if detection_index >= normalized_detections.shape[0] or detection_index >= detection_class_values.numel():
                 continue
@@ -243,6 +247,8 @@ def register_temporal_observations(
         if not 0 <= object_index < object_count:
             continue
         track_id = track_values[detection_index] if detection_index < len(track_values) else None
+        if track_id is not None and track_id < 0:
+            track_id = None
         if track_id is not None and track_id not in track_rows[object_index]:
             track_rows[object_index].append(track_id)
         image_id = detection_image_ids[detection_index] if detection_index < len(detection_image_ids) else None

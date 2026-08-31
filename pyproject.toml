@@ -14,6 +14,7 @@ dependencies = [
     "torchaudio",
     "transformers>=4.57.0",
     "ultralytics",
+    "lapx>=0.5.2",
     "opencv-python",
     "h5py",
     "huggingface_hub",
