@@ -17,6 +17,60 @@ def _tensor_values(value: Any) -> list[int]:
         return []
 
 
+def _object_semantic_kind(state: dict[str, Any], object_index: int) -> str:
+    dynamic_words = ("person", "human", "man", "woman", "child", "dog", "cat", "animal", "robot")
+    movable_words = ("chair", "box", "bag", "bottle", "cart", "suitcase", "bicycle", "stroller")
+    structural_words = ("wall", "floor", "ceiling", "desk", "table", "cabinet", "shelf", "door frame")
+    for key in ("object_caption", "object_category", "object_detection_category"):
+        rows = state.get(key) or []
+        text = str(rows[object_index] or "").casefold() if object_index < len(rows) else ""
+        if not text:
+            continue
+        if any(word in text for word in dynamic_words):
+            return "dynamic_capable"
+        if any(word in text for word in movable_words):
+            return "movable"
+        if any(word in text for word in structural_words):
+            return "structural"
+    return "unknown"
+
+
+def _position_compatible_for_identity(
+    state: dict[str, Any],
+    seg_outputs: dict[str, Any],
+    detection_index: int,
+    object_index: int,
+) -> bool:
+    """Reject impossible furniture/structure jumps before identities merge.
+
+    Person/animal tracks remain unconstrained here because their physical
+    motion is expected. For other known semantics, a >0.55 m one-update jump
+    is safer as a new node until temporal or measured-depth evidence can join
+    it later. Missing geometry/semantics preserves the legacy behaviour.
+    """
+    detection_means = seg_outputs.get("means")
+    if not isinstance(detection_means, torch.Tensor) or detection_index >= detection_means.shape[0]:
+        return True
+    kind = _object_semantic_kind(state, object_index)
+    if kind in {"unknown", "dynamic_capable"}:
+        return True
+    current_rows = state.get("object_current_state") or []
+    current = current_rows[object_index] if object_index < len(current_rows) else {}
+    position = current.get("position") if isinstance(current, dict) else None
+    if position is None:
+        means = state.get("means")
+        if not isinstance(means, torch.Tensor) or object_index >= means.shape[0]:
+            return True
+        reference = means[object_index].detach().to("cpu", dtype=torch.float32)
+    else:
+        reference = torch.as_tensor(position, dtype=torch.float32).reshape(-1)[:3]
+    detected = detection_means[detection_index].detach().to("cpu", dtype=torch.float32).reshape(-1)[:3]
+    if reference.numel() < 3 or detected.numel() < 3 or not torch.isfinite(reference).all() or not torch.isfinite(detected).all():
+        return True
+    limit = 0.35 if kind == "structural" else 0.55
+    return float(torch.linalg.vector_norm(detected - reference).item()) <= limit
+
+
 def apply_instance_track_correspondence(
     state: dict[str, Any],
     seg_outputs: dict[str, Any] | None,
@@ -29,7 +83,8 @@ def apply_instance_track_correspondence(
 ) -> tuple[torch.Tensor, int]:
     """Apply stable SAM identity, then conservatively stitch new tracklets.
 
-    Exact track IDs are authoritative. If an unknown track is geometrically
+    Exact track IDs are authoritative unless they make a physically implausible
+    furniture/structure jump. If an unknown track is geometrically
     unmatched (typically after occlusion plus object motion), a same-class
     DINO match can reuse a persistent node only when the appearance score is
     high, unambiguous, and the candidate did not coexist in the same image.
@@ -53,9 +108,15 @@ def apply_instance_track_correspondence(
             continue
     result = det_idx.clone()
     forced = 0
+    rejected_jumps = 0
     for detection_index, track_id in enumerate(detection_tracks[: result.numel()]):
         object_index = lookup.get(track_id)
         if object_index is None or object_index >= obj_idx.numel():
+            continue
+        if not _position_compatible_for_identity(state, seg_outputs, detection_index, object_index):
+            if int(result[detection_index].item()) == object_index:
+                result[detection_index] = -1
+            rejected_jumps += 1
             continue
         # det_idx indexes obj_idx; object_index is valid because obj_idx spans N.
         if int(result[detection_index].item()) != object_index:
@@ -125,10 +186,14 @@ def apply_instance_track_correspondence(
             if best_score < float(reid_similarity_threshold) or best_score - second_score < float(reid_margin):
                 continue
             object_index = candidates[best_offset]
+            if not _position_compatible_for_identity(state, seg_outputs, detection_index, object_index):
+                rejected_jumps += 1
+                continue
             result[detection_index] = object_index
             claimed.add(object_index)
             reidentified += 1
     state["_last_instance_reid_assignments"] = int(reidentified)
+    state["_last_identity_jump_rejections"] = int(rejected_jumps)
     return result, forced
 
 

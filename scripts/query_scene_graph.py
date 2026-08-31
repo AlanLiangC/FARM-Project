@@ -55,6 +55,14 @@ def main() -> int:
             import torch
 
             from scene_graph.retrieval.spatial_reasoning import execute_spatial_query, parse_query
+            from scene_graph.retrieval.spatial_reasoning.models import Predicate, QueryGraph
+            from scene_graph.retrieval.temporal import (
+                apply_4d_constraints,
+                format_query_plan,
+                format_temporal_evidence,
+                parse_temporal_query,
+                temporal_scene_slice,
+            )
 
             payload = torch.load(pt_path, map_location="cpu", weights_only=False)
             feature_dim = payload.get("feature_dim") if isinstance(payload, dict) else None
@@ -66,19 +74,34 @@ def main() -> int:
             captions = state.get("object_caption") or []
             llm = LLMInterface(verbose=False)
             t0 = time.time()
-            query_graph = parse_query(args.query, llm)
+            temporal_request = parse_temporal_query(args.query, state)
+            spatial_query = temporal_request.cleaned_query or args.query
+            query_state = temporal_scene_slice(state, temporal_request)
+            query_graph = parse_query(spatial_query, llm)
+            if query_graph is None or not query_graph.predicates:
+                target_desc = query_graph.target_description if query_graph is not None else spatial_query
+                query_graph = QueryGraph(
+                    target_description=target_desc,
+                    predicates=[Predicate("IsCategory", ["$target", target_desc])],
+                    reasoning="semantic-only (no predicates parsed)",
+                )
             scored = execute_spatial_query(
-                query_graph, state, llm, embedder,
+                query_graph, query_state, llm, embedder,
                 use_vlm=False, pre_filter_k=-1, max_output_candidates=max(args.top_k, 20),
-                raw_query=args.query, retrieval_mode="multi", candidate_pool_mode="active",
+                raw_query=spatial_query, retrieval_mode="multi", candidate_pool_mode="active",
                 spatial_method=str(args.spatial_method), verbose=False,
             )
+            scored = apply_4d_constraints(state, scored, temporal_request)
             dt = time.time() - t0
             preds = ", ".join(f"{p.name}({', '.join(map(str, p.args))})" for p in query_graph.predicates)
             print(f"\nquery={args.query!r} [{args.spatial_method}] -> parsed [{preds}] in {dt:.2f}s\n")
+            if temporal_request.is_4d:
+                print(f"  4D plan: {format_query_plan(state, temporal_request)}")
+                print(f"  spatial residual: {spatial_query!r}\n")
             for rank, cand in enumerate(scored[: args.top_k], start=1):
                 cap = str(captions[cand.object_index] if cand.object_index < len(captions) else "") or "(no caption)"
                 cap = (cap[:70] + "…") if len(cap) > 70 else cap
+                cap += format_temporal_evidence(state, int(cand.object_index), temporal_request)
                 anchors = ", ".join(str(a) for a in (cand.matched_anchors or {}).values())
                 extra = f" anchors=[{anchors}]" if anchors else ""
                 print(f"  #{rank} object_id={cand.object_id} score={cand.composite_score:.3f}{extra} {cap!r}")

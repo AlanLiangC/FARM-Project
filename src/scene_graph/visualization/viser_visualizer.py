@@ -1590,7 +1590,43 @@ class PipelineViserVisualizer:
                 closest_examples.append(f"the {t} closest to the {anchor}")
             else:
                 plain_examples.append(f"a {t}")
-        examples = near_examples + nearest_examples + closest_examples
+        # Add one answerable 4-D example when the scene contains a tracked
+        # moved object. Its window/threshold are derived from persisted
+        # evidence instead of being a hand-written demo that may return none.
+        four_d_examples: list[str] = []
+        motion_rows = scene_state.get("object_motion_state") or []
+        temporal_rows = scene_state.get("object_temporal_observations") or []
+        current_rows = scene_state.get("object_current_state") or []
+        origin_ns = int(scene_state.get("temporal_origin_ns", 0) or 0)
+        motion_indices = sorted(
+            range(len(motion_rows)),
+            key=lambda idx: float(motion_rows[idx].get("displacement_m", 0.0) or 0.0)
+            if isinstance(motion_rows[idx], dict) else 0.0,
+            reverse=True,
+        )
+        for i in motion_indices:
+            motion = motion_rows[i]
+            if not isinstance(motion, dict) or not bool(motion.get("ever_moved", motion.get("is_dynamic"))):
+                continue
+            category = str(categories[i] if i < len(categories) else "object").strip().lower() or "object"
+            observations = temporal_rows[i] if i < len(temporal_rows) and isinstance(temporal_rows[i], list) else []
+            current = current_rows[i] if i < len(current_rows) and isinstance(current_rows[i], dict) else {}
+            if not observations or current.get("position") is None:
+                continue
+            stamps = sorted(int(value.get("timestamp_ns", 0)) for value in observations if isinstance(value, dict))
+            if not stamps:
+                continue
+            sample_stamp = stamps[min(2, len(stamps) - 1)]
+            sample_s = max(0.0, (sample_stamp - origin_ns) / 1.0e9)
+            displacement = float(motion.get("displacement_m", 0.0) or 0.0)
+            threshold = max(0.1, min(0.8, np.floor(displacement * 5.0) / 10.0))
+            four_d_examples.append(
+                f"Which {category} was visible at {sample_s:.2f} seconds, later moved by more than "
+                f"{threshold:g} meters, and where is that same object now?"
+            )
+            break
+
+        examples = four_d_examples + near_examples + nearest_examples + closest_examples
         for plain in plain_examples:
             if len(examples) >= self._QUERY_EXAMPLE_COUNT:
                 break
@@ -1802,9 +1838,11 @@ class PipelineViserVisualizer:
         from scene_graph.retrieval.spatial_reasoning import execute_spatial_query, parse_query
         from scene_graph.retrieval.spatial_reasoning.models import Predicate, QueryGraph
         from scene_graph.retrieval.temporal import (
+            apply_4d_constraints,
+            format_query_plan,
             format_temporal_evidence,
             parse_temporal_query,
-            temporal_snapshot,
+            temporal_scene_slice,
         )
 
         state = self._latest_scene_state or {}
@@ -1812,6 +1850,10 @@ class PipelineViserVisualizer:
         embedder = self._retrieval_embedder
         temporal_request = parse_temporal_query(query, state)
         spatial_query = temporal_request.cleaned_query or query
+        # Historical relations must be evaluated with historical geometry.
+        # The view is shallow except for means/active/cov6, so this adds little
+        # memory and cannot mutate the live map.
+        query_state = temporal_scene_slice(state, temporal_request)
 
         # 1. Relational decomposition (needs the LLM; falls back to semantic-only).
         query_graph = None
@@ -1826,7 +1868,7 @@ class PipelineViserVisualizer:
         if query_graph is not None and query_graph.predicates:
             method = f"spatial (relational, {spatial_method})"
             scored = execute_spatial_query(
-                query_graph, state, llm, embedder,
+                query_graph, query_state, llm, embedder,
                 use_vlm=False, pre_filter_k=-1, max_output_candidates=20, raw_query=spatial_query,
                 retrieval_mode="multi", candidate_pool_mode="active",
                 spatial_method=spatial_method, verbose=False,
@@ -1841,19 +1883,15 @@ class PipelineViserVisualizer:
                     predicates=[Predicate("IsCategory", ["$target", target_desc])],
                     reasoning="semantic-only (no predicates parsed)",
                 ),
-                state, llm, embedder,
+                query_state, llm, embedder,
                 use_vlm=False, pre_filter_k=-1, max_output_candidates=20, raw_query=spatial_query,
                 retrieval_mode="multi", candidate_pool_mode="active",
                 spatial_method=fallback_method, verbose=False,
             )
 
-        scored = sorted(scored, key=lambda c: float(c.composite_score), reverse=True)
-        if temporal_request.mode in {"elapsed", "timestamp", "latest", "earliest"}:
-            scored = [
-                candidate
-                for candidate in scored
-                if temporal_snapshot(state, int(candidate.object_index), temporal_request) is not None
-            ]
+        scored = apply_4d_constraints(state, scored, temporal_request)
+        if temporal_request.is_4d:
+            method = f"4D {method} · {format_query_plan(state, temporal_request)}"
         captions = state.get("object_caption") or []
         object_ids_np = None
         with contextlib.suppress(Exception):
