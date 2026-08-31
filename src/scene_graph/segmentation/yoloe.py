@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import hashlib
+import json
 import os
 import time
 from collections import OrderedDict
@@ -77,6 +78,7 @@ class YOLOESegmenter(SegmentationBackend):
         vis_segmentation_dir: Path | str | None = None,
         timing_enabled: bool = False,
         track_instances: bool | None = None,
+        person_track_manifest: Path | str | None = None,
         # debug_save_detections: bool = False,
         # debug_save_protos: bool = False,
         # log_time: bool = False
@@ -113,6 +115,18 @@ class YOLOESegmenter(SegmentationBackend):
                 "1", "true", "yes", "on",
             }
         self._instance_tracker = TemporalInstanceTracker() if track_instances else None
+        self._person_track_manifest = (
+            Path(person_track_manifest).expanduser().resolve() if person_track_manifest else None
+        )
+        self._person_track_rows: list[dict[str, object]] = []
+        self._person_track_cursor = 0
+        if self._person_track_manifest is not None:
+            if not self._use_dino_features:
+                raise ValueError("person-track augmentation requires use_dino_features=True")
+            person_payload = json.loads(self._person_track_manifest.read_text(encoding="utf-8"))
+            if person_payload.get("backend") != "yolo11_person_bytetrack_v1":
+                raise ValueError(f"unsupported person track manifest: {self._person_track_manifest}")
+            self._person_track_rows = list(person_payload.get("frames") or [])
         self.names: list[str] = []
         self.model = self._init_prompt_free_model()
         head = self.model.model.model[-1]
@@ -196,6 +210,75 @@ class YOLOESegmenter(SegmentationBackend):
             if self.dino_extractor.hidden_size is None:
                 raise RuntimeError("Unable to determine DINO hidden size; ensure weights are available.")
             self.feature_dim = int(self.dino_extractor.hidden_size)
+
+    def _load_person_tracks(
+        self,
+        expected_hw: tuple[int, int],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self._person_track_manifest is None:
+            return (
+                torch.empty((0, *expected_hw), dtype=torch.bool, device=self.device),
+                torch.empty((0, 4), dtype=torch.float32, device=self.device),
+                torch.empty((0,), dtype=torch.float32, device=self.device),
+                torch.empty((0,), dtype=torch.int64, device=self.device),
+            )
+        if self._person_track_cursor >= len(self._person_track_rows):
+            raise RuntimeError(
+                f"person track cache exhausted at frame {self._person_track_cursor}; "
+                f"manifest has {len(self._person_track_rows)} frames"
+            )
+        row = self._person_track_rows[self._person_track_cursor]
+        self._person_track_cursor += 1
+        path = self._person_track_manifest.parent / str(row["path"])
+        with np.load(path, allow_pickle=False) as saved:
+            shape = tuple(int(value) for value in saved["mask_shape"].tolist())
+            track_ids = np.asarray(saved["track_ids"], dtype=np.int64)
+            scores = np.asarray(saved["scores"], dtype=np.float32)
+            boxes = np.asarray(saved["boxes_xyxy"], dtype=np.float32)
+            bits = np.asarray(saved["mask_bits"], dtype=np.uint8)
+        count = len(track_ids)
+        masks_np = (
+            np.unpackbits(bits, axis=1, count=shape[0] * shape[1], bitorder="little")
+            .reshape(count, *shape)
+            .astype(bool)
+            if count
+            else np.empty((0, *shape), dtype=bool)
+        )
+        masks = torch.from_numpy(masks_np).to(self.device)
+        if shape != expected_hw:
+            scale_x = expected_hw[1] / max(1, shape[1])
+            scale_y = expected_hw[0] / max(1, shape[0])
+            masks = F.interpolate(masks.float().unsqueeze(1), size=expected_hw, mode="nearest").squeeze(1) > 0.5
+            boxes[:, [0, 2]] *= scale_x
+            boxes[:, [1, 3]] *= scale_y
+        return (
+            masks,
+            torch.from_numpy(boxes).to(self.device),
+            torch.from_numpy(scores).to(self.device),
+            torch.from_numpy(track_ids).to(self.device),
+        )
+
+    def _letterbox_binary_masks(
+        self,
+        masks: torch.Tensor,
+        target_hw: tuple[int, int],
+        ratio: tuple[float, float],
+        pad: tuple[float, float],
+    ) -> torch.Tensor:
+        if not len(masks):
+            return torch.empty((0, *target_hw), dtype=torch.bool, device=self.device)
+        source_h, source_w = masks.shape[-2:]
+        resized_h = max(1, min(target_hw[0], int(round(source_h * float(ratio[1])))))
+        resized_w = max(1, min(target_hw[1], int(round(source_w * float(ratio[0])))))
+        resized = F.interpolate(
+            masks.float().unsqueeze(1), size=(resized_h, resized_w), mode="nearest"
+        ).squeeze(1) > 0.5
+        top, left = int(round(float(pad[1]))), int(round(float(pad[0])))
+        result = torch.zeros((len(masks), *target_hw), dtype=torch.bool, device=self.device)
+        bottom = min(target_hw[0], top + resized_h)
+        right = min(target_hw[1], left + resized_w)
+        result[:, top:bottom, left:right] = resized[:, : bottom - top, : right - left]
+        return result
 
     def _init_prompt_free_model(self) -> YOLOE:
         print(f"vocab file path: {self.vocab_file}")
@@ -880,6 +963,7 @@ class YOLOESegmenter(SegmentationBackend):
         colors: Sequence[torch.Tensor],
         masks: torch.Tensor | Sequence[torch.Tensor],
         boxes: torch.Tensor,
+        scores: torch.Tensor,
         labels: Sequence[str],
         features: torch.Tensor,
         batch_ids: torch.Tensor,
@@ -932,6 +1016,7 @@ class YOLOESegmenter(SegmentationBackend):
                 [labels[int(index)] for index in indices],
                 descriptors,
                 feature_rows[indices],
+                scores.detach().to("cpu", dtype=torch.float32).numpy()[indices],
             )
             assigned[torch.as_tensor(indices, device=assigned.device)] = torch.as_tensor(
                 track_ids, dtype=torch.int64, device=assigned.device
@@ -1161,7 +1246,11 @@ class YOLOESegmenter(SegmentationBackend):
             mask_coeffs_b_full = det[:, 6:]
             if attach_lrpc_indices and mask_dim > 0:
                 mask_coeffs_b = mask_coeffs_b_full[:, :mask_dim]
-                det_indices_b = mask_coeffs_b_full[:, mask_dim:].long()
+                # LR-PC appends a single source-column index to every
+                # detection, which leaves this slice shaped ``(N, 1)``.
+                # Keep all downstream detection-aligned vectors 1-D; the
+                # hybrid person channel appends its own sentinel indices.
+                det_indices_b = mask_coeffs_b_full[:, mask_dim:].long().reshape(-1)
             else:
                 mask_coeffs_b = mask_coeffs_b_full
                 det_indices_b = torch.empty((n_b,), device=self.device, dtype=torch.long)
@@ -1203,7 +1292,7 @@ class YOLOESegmenter(SegmentationBackend):
             masks = masks_ragged
             batch_ids = torch.cat(batch_ids_chunks, dim=0)
             col_indices = (
-                torch.cat(col_indices_list, dim=0)
+                torch.cat(col_indices_list, dim=0).reshape(-1)
                 if attach_lrpc_indices
                 else torch.empty((0,), device=self.device, dtype=torch.long)
             )
@@ -1220,6 +1309,99 @@ class YOLOESegmenter(SegmentationBackend):
             batch_ids = torch.empty((0,), device=self.device, dtype=torch.int64)
             col_indices = torch.empty((0,), device=self.device, dtype=torch.long)
             masks_letterbox = torch.empty((0, img_hw[0], img_hw[1]), device=self.device, dtype=torch.bool)
+
+        # Hybrid person channel: YOLOE's open vocabulary is kept for long-tail
+        # objects, while a COCO person segmenter supplies high-recall masks and
+        # ByteTrack-style identities. Suppress YOLOE masks that substantially
+        # cover the same person; otherwise a person-in-front-of-chair mask can
+        # contaminate both the static chair and the dynamic person node.
+        person_track_hints = torch.full((len(boxes),), -1, dtype=torch.int64, device=self.device)
+        if self._person_track_manifest is not None:
+            keep_existing = torch.ones((len(boxes),), dtype=torch.bool, device=self.device)
+            person_masks_original: list[torch.Tensor] = []
+            person_masks_letterbox: list[torch.Tensor] = []
+            person_boxes: list[torch.Tensor] = []
+            person_scores: list[torch.Tensor] = []
+            person_tracks: list[torch.Tensor] = []
+            person_batches: list[torch.Tensor] = []
+            for batch_index, shape in enumerate(orig_shapes):
+                fallback_masks, fallback_boxes, fallback_scores, fallback_tracks = self._load_person_tracks(shape)
+                if not len(fallback_boxes):
+                    continue
+                existing_indices = torch.nonzero(batch_ids == batch_index, as_tuple=False).view(-1)
+                if existing_indices.numel():
+                    existing_masks = torch.stack([masks[int(index)] for index in existing_indices], dim=0)
+                    intersections = (
+                        existing_masks[:, None] & fallback_masks[None, :]
+                    ).sum(dim=(2, 3)).float()
+                    existing_area = existing_masks.sum(dim=(1, 2)).float()[:, None]
+                    fallback_area = fallback_masks.sum(dim=(1, 2)).float()[None, :]
+                    overlap_smaller = intersections / torch.minimum(existing_area, fallback_area).clamp(min=1.0)
+                    duplicate = (overlap_smaller >= 0.55).any(dim=1)
+                    keep_existing[existing_indices[duplicate]] = False
+                person_masks_original.extend(fallback_masks.unbind(0))
+                person_masks_letterbox.extend(
+                    self._letterbox_binary_masks(
+                        fallback_masks,
+                        (int(img_hw[0]), int(img_hw[1])),
+                        ratios[batch_index],
+                        pads[batch_index],
+                    ).unbind(0)
+                )
+                person_boxes.append(fallback_boxes)
+                person_scores.append(fallback_scores)
+                # Reserve a disjoint ID namespace from YOLOE's online tracker.
+                person_tracks.append(fallback_tracks + 1_000_000)
+                person_batches.append(
+                    torch.full((len(fallback_boxes),), batch_index, dtype=torch.int64, device=self.device)
+                )
+
+            if keep_existing.numel() and not bool(keep_existing.all()):
+                kept = torch.nonzero(keep_existing, as_tuple=False).view(-1)
+                boxes, scores, class_ids, batch_ids = boxes[kept], scores[kept], class_ids[kept], batch_ids[kept]
+                masks = [masks[int(index)] for index in kept]
+                masks_letterbox = masks_letterbox[kept]
+                if col_indices.numel():
+                    col_indices = col_indices[kept]
+                person_track_hints = person_track_hints[kept]
+
+            if person_boxes:
+                fallback_boxes = torch.cat(person_boxes)
+                fallback_scores = torch.cat(person_scores)
+                fallback_tracks = torch.cat(person_tracks)
+                fallback_batches = torch.cat(person_batches)
+                try:
+                    person_class_id = self.names.index("person")
+                except ValueError as exc:
+                    raise RuntimeError("YOLOE vocabulary must include 'person' for person-track augmentation") from exc
+                boxes = torch.cat((boxes, fallback_boxes))
+                scores = torch.cat((scores, fallback_scores))
+                class_ids = torch.cat(
+                    (
+                        class_ids,
+                        torch.full(
+                            (len(fallback_boxes),), person_class_id, dtype=torch.int64, device=self.device
+                        ),
+                    )
+                )
+                batch_ids = torch.cat((batch_ids, fallback_batches))
+                masks.extend(person_masks_original)
+                masks_letterbox = torch.cat((masks_letterbox, torch.stack(person_masks_letterbox)))
+                person_track_hints = torch.cat((person_track_hints, fallback_tracks))
+                if col_indices.numel():
+                    col_indices = torch.cat(
+                        (col_indices, torch.full((len(fallback_boxes),), -1, dtype=torch.int64, device=self.device))
+                    )
+
+            if len(batch_ids):
+                order = torch.argsort(batch_ids, stable=True)
+                boxes, scores, class_ids, batch_ids = boxes[order], scores[order], class_ids[order], batch_ids[order]
+                masks = [masks[int(index)] for index in order]
+                masks_letterbox = masks_letterbox[order]
+                person_track_hints = person_track_hints[order]
+                if col_indices.numel():
+                    col_indices = col_indices[order]
+            det_per_img = [int((batch_ids == index).sum().item()) for index in range(batch_size)]
 
         # Letterbox depth maps to the same target size as the RGB model input so we can batch-stack them.
         # This keeps the entire 3D-stat computation vectorized on GPU even with mixed input resolutions.
@@ -1468,11 +1650,20 @@ class YOLOESegmenter(SegmentationBackend):
             colors,
             masks,
             boxes,
+            scores,
             [str(detection.get("Object Category") or "object") for detection in detections],
             vis_features,
             batch_ids,
             camera_names,
         )
+        if bool((person_track_hints >= 0).any()):
+            if instance_track_ids is None:
+                instance_track_ids = torch.full_like(person_track_hints, -1)
+            instance_track_ids = torch.where(
+                person_track_hints >= 0,
+                person_track_hints,
+                instance_track_ids,
+            )
         out = {
             "batch_ids": batch_ids,  # (M,)
             "boxes_xyxy": boxes,  # (M,4)

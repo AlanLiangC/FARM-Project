@@ -74,6 +74,7 @@ def declare_mapper_parameters(node: Node) -> None:
     node.declare_parameter("segmenter_flush_every_n_messages", 5)
     node.declare_parameter("segmenter_backend", "yoloe")
     node.declare_parameter("segmenter_sam3_manifest", "")
+    node.declare_parameter("segmenter_person_track_manifest", "")
 
     node.declare_parameter("lock_initial_scene_state", True)
 

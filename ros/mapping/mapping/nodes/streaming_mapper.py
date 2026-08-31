@@ -475,6 +475,9 @@ class StreamingMapper(Node):
             )
             ros_logger.info(f"Segmentation backend: SAM3.1 tracks from {sam3_manifest}")
         elif segmenter_backend == "yoloe":
+            person_track_manifest = str(
+                self.get_parameter("segmenter_person_track_manifest").value or ""
+            ).strip() or None
             self._segmenter = YOLOESegmenter(
                 model_id=model_id,
                 vocab_file=vocab_file,
@@ -491,6 +494,7 @@ class StreamingMapper(Node):
                 depth_mode_min_mad_m=depth_mode_min_mad_m,
                 vis_segmentation_dir=vis_segmentation_dir,
                 timing_enabled=self._timing_enabled,
+                person_track_manifest=person_track_manifest,
             )
         else:
             raise RuntimeError(f"unsupported segmenter_backend={segmenter_backend!r}")
@@ -1523,7 +1527,16 @@ class StreamingMapper(Node):
         msg.object_ids = [int(obj_ids_cpu[i].item()) for i in include_idx]
         means_selected = means_cpu[include_idx].to(dtype=torch.float32).contiguous().view(-1)
         msg.mean_xyz = [float(x) for x in means_selected.tolist()]
-        msg.object_captions = [str(captions[i] if i < len(captions) else "") for i in include_idx]
+        cov6_selected = cov6_cpu[include_idx].to(dtype=torch.float32).contiguous().view(-1)
+        msg.cov6 = [float(x) for x in cov6_selected.tolist()]
+        detection_categories: List[str] = state.get("object_detection_category", []) or []
+        msg.object_captions = [
+            str(
+                (captions[i] if i < len(captions) else "")
+                or (detection_categories[i] if i < len(detection_categories) else "")
+            )
+            for i in include_idx
+        ]
 
         camera_names = sorted(CAMERA_CONFIG.keys())
         camera_to_id = {name: idx for idx, name in enumerate(camera_names)}
@@ -1692,9 +1705,17 @@ class StreamingMapper(Node):
         if object_count <= 0:
             state["object_detection_category"] = []
             state["object_detection_category_conf"] = []
+            state["object_detection_category_evidence"] = []
             return
 
-        raw_list = state.get("object_detection_category_conf")
+        # ``*_evidence`` stores the unbounded sum of per-frame detector
+        # scores. ``*_conf`` is derived below as a normalized vote share for
+        # compatibility with graph/viewer consumers that expect [0, 1].
+        raw_list = state.get("object_detection_category_evidence")
+        if not isinstance(raw_list, Sequence) or isinstance(raw_list, (str, bytes, bytearray)):
+            # Backward-compatible seed for checkpoints written before
+            # temporal evidence was persisted separately.
+            raw_list = state.get("object_detection_category_conf")
         det_list_raw = (
             list(raw_list)
             if isinstance(raw_list, Sequence) and not isinstance(raw_list, (str, bytes, bytearray))
@@ -1742,15 +1763,12 @@ class StreamingMapper(Node):
                 continue
             winner_map = det_list[winner_idx]
             for category, score in loser_map.items():
-                prev = winner_map.get(category)
-                if prev is None or float(score) > float(prev):
-                    winner_map[category] = float(score)
+                winner_map[category] = float(winner_map.get(category, 0.0)) + max(0.0, float(score))
             det_list[old_idx] = {}
 
         det_winner_list = self._to_plain_list(det_idx)
         if not det_winner_list:
-            state["object_detection_category_conf"] = det_list
-            self._sync_detection_categories(det_list)
+            self._store_detection_evidence(det_list)
             return
 
         scores_list = self._to_plain_list(seg_outputs.get("scores"))
@@ -1794,12 +1812,32 @@ class StreamingMapper(Node):
             if not category:
                 continue
             obj_map = det_list[obj_target]
-            prev = obj_map.get(category)
-            if prev is None or float(score) > float(prev):
-                obj_map[category] = float(score)
+            # Weighted temporal voting: many consistent observations must
+            # beat one high-confidence mistake.
+            obj_map[category] = float(obj_map.get(category, 0.0)) + float(score)
 
-        state["object_detection_category_conf"] = det_list
-        self._sync_detection_categories(det_list)
+        self._store_detection_evidence(det_list)
+
+    def _store_detection_evidence(self, evidence: Sequence[Dict[str, float]]) -> None:
+        """Persist raw temporal votes and bounded category shares."""
+        normalized: List[Dict[str, float]] = []
+        cleaned: List[Dict[str, float]] = []
+        for entry in evidence:
+            row = {
+                str(category): max(0.0, float(score))
+                for category, score in (entry.items() if isinstance(entry, dict) else [])
+                if str(category) and math.isfinite(float(score)) and float(score) > 0.0
+            }
+            total = float(sum(row.values()))
+            cleaned.append(row)
+            normalized.append(
+                {category: float(score / total) for category, score in row.items()}
+                if total > 0.0
+                else {}
+            )
+        self._scene_state["object_detection_category_evidence"] = cleaned
+        self._scene_state["object_detection_category_conf"] = normalized
+        self._sync_detection_categories(normalized)
 
     def _sync_detection_categories(self, det_list: Sequence[Dict[str, float]]) -> None:
         """Persist the detector winner without modifying VLM-owned semantics."""

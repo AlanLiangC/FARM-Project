@@ -5,6 +5,7 @@ uint64 seq
 # -------- Objects (parallel arrays; length = num_objects) --------
 uint32[] object_ids
 float32[] mean_xyz            # length = 3*num_objects, packed [x,y,z,x,y,z,...]
+float32[] cov6                # length = 6*num_objects, packed upper-triangular covariance
 string[] object_captions
 
 # -------- Viewpoints (ragged, per object) --------

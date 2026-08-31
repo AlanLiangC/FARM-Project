@@ -83,6 +83,8 @@ class _Track:
     feature: np.ndarray | None
     last_frame: int
     hits: int = 1
+    velocity: np.ndarray | None = None
+    confidence: float = 1.0
 
 
 class TemporalInstanceTracker:
@@ -94,8 +96,16 @@ class TemporalInstanceTracker:
     co-visible people or cups never collapse merely because they share a class.
     """
 
-    def __init__(self, *, max_dormant_frames: int = 256) -> None:
+    def __init__(
+        self,
+        *,
+        max_dormant_frames: int = 256,
+        high_confidence_threshold: float = 0.35,
+        low_confidence_threshold: float = 0.05,
+    ) -> None:
         self.max_dormant_frames = max(8, int(max_dormant_frames))
+        self.high_confidence_threshold = float(high_confidence_threshold)
+        self.low_confidence_threshold = float(low_confidence_threshold)
         self._next_track_id = 1
         self._frame_index: dict[str, int] = {}
         self._tracks: dict[str, dict[int, _Track]] = {}
@@ -107,6 +117,7 @@ class TemporalInstanceTracker:
         labels: Sequence[str],
         appearances: np.ndarray,
         features: np.ndarray | None = None,
+        scores: np.ndarray | None = None,
     ) -> np.ndarray:
         camera = str(camera or "camera")
         frame_index = self._frame_index.get(camera, -1) + 1
@@ -128,33 +139,84 @@ class TemporalInstanceTracker:
             if features is not None and np.asarray(features).size
             else None
         )
+        score_rows = (
+            np.asarray(scores, dtype=np.float32).reshape(len(boxes))
+            if scores is not None and np.asarray(scores).size
+            else np.ones((len(boxes),), dtype=np.float32)
+        )
         assigned = np.full((len(boxes),), -1, dtype=np.int64)
         candidates: list[tuple[float, int, int, float, int]] = []
         dormant_alternatives: dict[int, list[float]] = {}
         for detection_index, (box, label, appearance) in enumerate(zip(boxes, labels, appearances)):
+            confidence = float(score_rows[detection_index])
+            if confidence < self.low_confidence_threshold:
+                continue
             feature = feature_rows[detection_index] if feature_rows is not None else None
             for track_id, track in tracks.items():
                 age = frame_index - track.last_frame
-                if age <= 0 or age > self.max_dormant_frames or not labels_related(label, track.label):
+                if age <= 0 or age > self.max_dormant_frames:
                     continue
-                overlap = box_iou(box, track.box)
+                label_agrees = labels_related(label, track.label)
+                velocity = track.velocity if track.velocity is not None else np.zeros((4,), dtype=np.float32)
+                predicted_box = track.box + velocity * min(age, 8)
+                overlap = box_iou(box, predicted_box)
                 appearance_score = cosine_similarity(appearance, track.appearance)
                 feature_score = cosine_similarity(feature, track.feature)
                 if age <= 5:
-                    allowed = overlap >= 0.015 or appearance_score >= 0.74
+                    # ByteTrack-style second association: low-confidence
+                    # detections may continue a recent trajectory but never
+                    # revive a dormant identity or create a new one.
+                    if confidence >= self.high_confidence_threshold:
+                        allowed = (
+                            (label_agrees and (overlap >= 0.015 or appearance_score >= 0.74))
+                            or (
+                                not label_agrees
+                                and overlap >= 0.20
+                                and appearance_score >= 0.78
+                                and feature_score >= 0.55
+                            )
+                        )
+                    else:
+                        allowed = age <= 2 and (
+                            (label_agrees and (overlap >= 0.08 or appearance_score >= 0.82))
+                            or (
+                                not label_agrees
+                                and overlap >= 0.35
+                                and appearance_score >= 0.86
+                                and feature_score >= 0.65
+                            )
+                        )
                     # A currently visible trajectory must win over an old
                     # dormant look-alike. Re-identification is only a fallback
                     # when no recent association claims the detection.
-                    score = 1.0 + 0.46 * overlap + 0.42 * appearance_score + 0.12 * feature_score
+                    score = (
+                        1.0
+                        + 0.46 * overlap
+                        + 0.34 * appearance_score
+                        + 0.12 * feature_score
+                        + 0.08 * confidence
+                        + (0.04 if label_agrees else 0.0)
+                    )
                 else:
-                    allowed = appearance_score >= 0.94 and feature_score >= 0.70
+                    allowed = (
+                        confidence >= self.high_confidence_threshold
+                        and appearance_score >= 0.94
+                        and feature_score >= 0.70
+                        and (label_agrees or (appearance_score >= 0.975 and feature_score >= 0.85))
+                    )
                     score = 0.72 * appearance_score + 0.28 * feature_score - min(age, 200) * 0.00015
                     dormant_alternatives.setdefault(detection_index, []).append(score)
                 if allowed:
                     candidates.append((score, detection_index, track_id, appearance_score, age))
 
         used_tracks: set[int] = set()
-        for score, detection_index, track_id, appearance_score, age in sorted(candidates, reverse=True):
+        # Match high-confidence detections first, then recover occluded
+        # objects from low-confidence detections as ByteTrack does.
+        for score, detection_index, track_id, appearance_score, age in sorted(
+            candidates,
+            key=lambda row: (score_rows[row[1]] >= self.high_confidence_threshold, row[0]),
+            reverse=True,
+        ):
             if assigned[detection_index] >= 0 or track_id in used_tracks:
                 continue
             if age > 5:
@@ -169,6 +231,8 @@ class TemporalInstanceTracker:
             feature = feature_rows[detection_index] if feature_rows is not None else None
             track_id = int(assigned[detection_index])
             if track_id < 0:
+                if float(score_rows[detection_index]) < self.high_confidence_threshold:
+                    continue
                 track_id = self._next_track_id
                 self._next_track_id += 1
                 tracks[track_id] = _Track(
@@ -178,10 +242,19 @@ class TemporalInstanceTracker:
                     appearance=_normalize(appearance),
                     feature=_normalize(feature),
                     last_frame=frame_index,
+                    velocity=np.zeros((4,), dtype=np.float32),
+                    confidence=float(score_rows[detection_index]),
                 )
                 assigned[detection_index] = track_id
                 continue
             track = tracks[track_id]
+            elapsed = max(1, frame_index - track.last_frame)
+            observed_velocity = (box - track.box) / float(elapsed)
+            track.velocity = (
+                observed_velocity.astype(np.float32)
+                if track.velocity is None
+                else (0.75 * track.velocity + 0.25 * observed_velocity).astype(np.float32)
+            )
             new_appearance = _normalize(appearance)
             new_feature = _normalize(feature)
             if new_appearance is not None:
@@ -196,6 +269,7 @@ class TemporalInstanceTracker:
             track.label = str(label)
             track.last_frame = frame_index
             track.hits += 1
+            track.confidence = float(score_rows[detection_index])
 
         expired = [track_id for track_id, track in tracks.items() if frame_index - track.last_frame > self.max_dormant_frames]
         for track_id in expired:
