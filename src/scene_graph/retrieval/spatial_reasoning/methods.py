@@ -31,9 +31,10 @@ class SpatialMethod:
     # if set, otherwise no class scoring at all" (back-compat path).
     class_mismatch_floor: Optional[float] = None
     # Track B (2026-05-17): which candidate signal(s) to match the
-    # parsed target_class against. ``"tiered"`` (default) checks YOLOE
-    # ``object_category`` first and falls back to ``object_caption`` only when
-    # the category is generic/uninformative. ``"yoloe"`` skips the caption.
+    # parsed target_class against. ``"tiered"`` (default) checks the resolved
+    # canonical ``object_category`` first and falls back to ``object_caption``
+    # only when the category is generic/uninformative. ``"yoloe"`` keeps its
+    # legacy name but means category-only and skips the caption.
     # ``"caption"`` skips the category. ``"both"`` matches if EITHER signal
     # contains the class term. Honored when ``class_mismatch_floor`` is set.
     class_match_source: str = "tiered"

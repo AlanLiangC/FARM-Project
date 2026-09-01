@@ -3007,6 +3007,12 @@ class PipelineViserVisualizer:
         decision: str,
         detector_category: str = "",
         detector_scores: Mapping[str, float] | None = None,
+        vlm_category: str = "",
+        category_source: str = "",
+        category_confidence: float = 0.0,
+        category_resolution: Mapping[str, object] | None = None,
+        vlm_caption: str = "",
+        caption_semantic_reliable: bool = True,
         mask_observation_count: int = 0,
     ) -> str:
         scores = {
@@ -3017,12 +3023,18 @@ class PipelineViserVisualizer:
         }
         payload = {
             "object_category": category,
+            "object_category_source": category_source,
+            "object_category_confidence": round(float(category_confidence), 4),
+            "object_category_resolution": dict(category_resolution or {}),
+            "object_vlm_category": vlm_category,
             "object_detection_category": detector_category,
             "object_detection_category_conf": scores,
             "object_mask_observation_count": max(0, int(mask_observation_count)),
             "object_supercategory": supercategory,
             "object_key_attributes": attributes,
             "object_caption": description,
+            "object_vlm_caption": vlm_caption,
+            "object_caption_semantic_reliable": bool(caption_semantic_reliable),
             "object_caption_decision": decision,
         }
         lines = [
@@ -3077,17 +3089,41 @@ class PipelineViserVisualizer:
             np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
             (len(fallback_centers), 1),
         )
-        if not self._object_box_from_voxels:
-            return fallback_centers, fallback_dimensions, rotations
-        arrays = self._object_voxel_arrays(scene_state)
-        if arrays is None:
-            return fallback_centers, fallback_dimensions, rotations
-        flat, offsets, levels = arrays
         centers = np.asarray(fallback_centers, dtype=np.float32).copy()
         dimensions = np.asarray(fallback_dimensions, dtype=np.float32).copy()
+        overrides = scene_state.get("_object_box_overrides")
+        overridden: set[int] = set()
+        if isinstance(overrides, dict):
+            for idx, object_index in enumerate(active_indices_all.tolist()):
+                value = overrides.get(int(object_index), overrides.get(str(int(object_index))))
+                if not isinstance(value, dict):
+                    continue
+                center = np.asarray(value.get("center", []), dtype=np.float32).reshape(-1)
+                dims = np.asarray(value.get("dimensions", []), dtype=np.float32).reshape(-1)
+                wxyz = np.asarray(value.get("wxyz", [1.0, 0.0, 0.0, 0.0]), dtype=np.float32).reshape(-1)
+                if (
+                    center.shape == (3,)
+                    and dims.shape == (3,)
+                    and wxyz.shape == (4,)
+                    and np.isfinite(center).all()
+                    and np.isfinite(dims).all()
+                    and np.isfinite(wxyz).all()
+                ):
+                    centers[idx] = center
+                    dimensions[idx] = np.maximum(dims, 0.08)
+                    rotations[idx] = wxyz
+                    overridden.add(int(object_index))
+        if not self._object_box_from_voxels:
+            return centers, dimensions, rotations
+        arrays = self._object_voxel_arrays(scene_state)
+        if arrays is None:
+            return centers, dimensions, rotations
+        flat, offsets, levels = arrays
         count = min(len(active_indices_all), centers.shape[0], dimensions.shape[0])
         for idx in range(count):
             obj_idx = int(active_indices_all[idx])
+            if obj_idx in overridden:
+                continue
             if obj_idx + 1 >= offsets.shape[0] or obj_idx >= levels.shape[0]:
                 continue
             start = int(offsets[obj_idx])
@@ -3136,8 +3172,14 @@ class PipelineViserVisualizer:
         cov6 = scene_state.get("cov6")
         object_ids = scene_state.get("object_id")
         object_captions = scene_state.get("object_caption") or []
+        object_vlm_captions = scene_state.get("object_vlm_caption") or []
+        object_caption_reliability = scene_state.get("object_caption_semantic_reliable") or []
         object_decisions = scene_state.get("object_caption_decision") or []
         object_categories = scene_state.get("object_category") or []
+        object_vlm_categories = scene_state.get("object_vlm_category") or []
+        object_category_sources = scene_state.get("object_category_source") or []
+        object_category_confidences = scene_state.get("object_category_confidence") or []
+        object_category_resolutions = scene_state.get("object_category_resolution") or []
         object_detection_categories = scene_state.get("object_detection_category") or []
         object_supercategories = scene_state.get("object_supercategory") or []
         object_key_attributes = scene_state.get("object_key_attributes") or []
@@ -3218,10 +3260,26 @@ class PipelineViserVisualizer:
                 if 0 <= obj_idx_all < len(object_captions)
                 else ""
             )
+            vlm_caption = self._string_value(
+                self._row_value(object_vlm_captions, obj_idx_all, caption_text)
+            )
+            caption_semantic_reliable = bool(
+                self._row_value(object_caption_reliability, obj_idx_all, True)
+            )
             category = self._string_value(self._row_value(object_categories, obj_idx_all, ""))
             detector_category = self._string_value(
                 self._row_value(object_detection_categories, obj_idx_all, "")
             )
+            vlm_category = self._string_value(
+                self._row_value(object_vlm_categories, obj_idx_all, "")
+            )
+            category_source = self._string_value(
+                self._row_value(object_category_sources, obj_idx_all, "")
+            )
+            category_confidence = float(
+                self._row_value(object_category_confidences, obj_idx_all, 0.0) or 0.0
+            )
+            category_resolution = self._row_value(object_category_resolutions, obj_idx_all, {})
             supercategory = self._string_value(self._row_value(object_supercategories, obj_idx_all, ""))
             key_attributes = self._string_list_value(self._row_value(object_key_attributes, obj_idx_all, []))
             decision = self._string_value(self._row_value(object_decisions, obj_idx_all, "")).lower()
@@ -3241,6 +3299,14 @@ class PipelineViserVisualizer:
                 decision=decision,
                 detector_category=detector_category,
                 detector_scores=det_map if isinstance(det_map, dict) else {},
+                vlm_category=vlm_category,
+                category_source=category_source,
+                category_confidence=category_confidence,
+                category_resolution=(
+                    category_resolution if isinstance(category_resolution, Mapping) else {}
+                ),
+                vlm_caption=vlm_caption,
+                caption_semantic_reliable=caption_semantic_reliable,
                 mask_observation_count=(
                     len(object_masks_all[obj_idx_all])
                     if 0 <= obj_idx_all < len(object_masks_all)

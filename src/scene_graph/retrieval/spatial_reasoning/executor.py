@@ -635,9 +635,9 @@ def _target_class_match_per_candidate(
 
     ``class_match_source`` (Track B, 2026-05-17) selects which candidate signal
     to match against:
-      - ``"tiered"`` (default): YOLOE ``object_category`` if informative,
+      - ``"tiered"`` (default): resolved canonical ``object_category`` if informative,
         else fall back to ``object_caption``. Current behavior.
-      - ``"yoloe"``: only the YOLOE ``object_category``; no caption fallback.
+      - ``"yoloe"``: category-only legacy mode; no caption fallback.
       - ``"caption"``: only the VLM ``object_caption``; skip the category.
       - ``"both"``: match if EITHER the category OR caption contains a term.
     """
@@ -648,6 +648,7 @@ def _target_class_match_per_candidate(
     captions = scene_state.get("object_caption", []) or []
     categories = scene_state.get("object_category", []) or []
     det_conf_list = scene_state.get("object_detection_category_conf", []) or []
+    resolved_conf_list = scene_state.get("object_category_confidence", []) or []
     out: Dict[int, bool] = {}
     src = str(class_match_source or "tiered").strip().lower()
     if src not in {"tiered", "yoloe", "caption", "both"}:
@@ -682,13 +683,21 @@ def _target_class_match_per_candidate(
         else:  # tiered
             yoloe_is_trustworthy = _category_is_informative(category)
             if yoloe_is_trustworthy and conf_thr is not None:
-                # Lookup conf for the chosen category.
+                # Prefer the explicit fusion confidence. Legacy states fall
+                # back to looking up the detector vote for the category.
+                conf = None
+                if 0 <= oid < len(resolved_conf_list):
+                    try:
+                        conf = float(resolved_conf_list[oid])
+                    except (TypeError, ValueError):
+                        conf = None
                 conf_dict: Dict[str, float] = (
                     det_conf_list[oid] if 0 <= oid < len(det_conf_list)
                     and isinstance(det_conf_list[oid], dict) else {}
                 )
                 # Try exact match first, then case-normalized.
-                conf = conf_dict.get(str(category)) if category is not None else None
+                if conf is None:
+                    conf = conf_dict.get(str(category)) if category is not None else None
                 if conf is None and category is not None:
                     norm_cat = _normalize_class_text(category)
                     for k, v in conf_dict.items():

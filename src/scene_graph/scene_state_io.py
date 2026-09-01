@@ -328,17 +328,37 @@ def load_scene_state(
         restored["images"] = []
 
     restored["object_caption"] = _ensure_list_len(restored.get("object_caption", []), N, "")
+    restored["object_vlm_caption"] = _ensure_list_len(restored.get("object_vlm_caption", []), N, "")
     restored["object_caption_decision"] = _ensure_list_len(restored.get("object_caption_decision", []), N, "")
     restored["object_category"] = _ensure_list_len(restored.get("object_category", []), N, "")
+    restored["object_vlm_category"] = _ensure_list_len(restored.get("object_vlm_category", []), N, "")
     restored["object_detection_category"] = _ensure_list_len(
         restored.get("object_detection_category", []), N, ""
     )
     restored["object_supercategory"] = _ensure_list_len(restored.get("object_supercategory", []), N, "")
+    restored["object_vlm_supercategory"] = _ensure_list_len(
+        restored.get("object_vlm_supercategory", []), N, ""
+    )
     restored["object_category_candidates"] = _ensure_list_len(
         restored.get("object_category_candidates", []), N, list
     )
+    restored["object_category_source"] = _ensure_list_len(
+        restored.get("object_category_source", []), N, ""
+    )
+    restored["object_category_confidence"] = _ensure_list_len(
+        restored.get("object_category_confidence", []), N, 0.0
+    )
+    restored["object_category_resolution"] = _ensure_list_len(
+        restored.get("object_category_resolution", []), N, dict
+    )
     restored["object_key_attributes"] = _ensure_list_len(restored.get("object_key_attributes", []), N, list)
     restored["object_caption_embedding"] = _ensure_list_len(restored.get("object_caption_embedding", []), N, list)
+    restored["object_vlm_caption_embedding"] = _ensure_list_len(
+        restored.get("object_vlm_caption_embedding", []), N, list
+    )
+    restored["object_caption_semantic_reliable"] = _ensure_list_len(
+        restored.get("object_caption_semantic_reliable", []), N, True
+    )
     restored["object_siglip2_embedding"] = _ensure_list_len(restored.get("object_siglip2_embedding", []), N, list)
     restored["object_qwen3_vl_embedding"] = _ensure_list_len(restored.get("object_qwen3_vl_embedding", []), N, list)
     restored["object_caption_history"] = _ensure_list_len(restored.get("object_caption_history", []), N, list)
@@ -395,6 +415,9 @@ def load_scene_state(
             out[key] = score
         normalized_det.append(out)
     restored["object_detection_category_conf"] = normalized_det
+    evidence_state = restored.get("object_detection_category_evidence")
+    evidence_list: list = evidence_state if isinstance(evidence_state, list) else []
+    restored["object_detection_category_evidence"] = _ensure_list_len(evidence_list, N, dict)
     detected_rows = restored.get("object_detection_category")
     detected_rows = detected_rows if isinstance(detected_rows, list) else []
     detected_rows = _ensure_list_len(detected_rows, N, "")

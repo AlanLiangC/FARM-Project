@@ -29,8 +29,11 @@ class SceneState(TypedDict, total=False):
 
     # -- Captions (current, per-object) --
     object_caption: List[str]
+    object_vlm_caption: List[str]
     object_caption_decision: List[str]
     object_caption_embedding: List[list]
+    object_vlm_caption_embedding: List[list]
+    object_caption_semantic_reliable: List[bool]
     object_siglip2_embedding: List[list]
     object_qwen3_vl_embedding: List[list]
 
@@ -41,15 +44,21 @@ class SceneState(TypedDict, total=False):
     object_qwen3_vl_embedding_history: List[List[list]]
 
     # -- Categories & attributes --
-    # Final semantics produced by the caption/VLM stage.
+    # Canonical query semantics plus separately preserved VLM evidence.
     object_category: List[str]
+    object_vlm_category: List[str]
     object_supercategory: List[str]
+    object_vlm_supercategory: List[str]
     object_category_candidates: List[List[str]]
+    object_category_source: List[str]
+    object_category_confidence: List[float]
+    object_category_resolution: List[Dict[str, Any]]
     object_key_attributes: List[List[str]]
     # Detector-only semantics.  The singular field is derived from the
     # highest-confidence entry in the official confidence mapping.
     object_detection_category: List[str]
     object_detection_category_conf: List[Dict[str, float]]
+    object_detection_category_evidence: List[Dict[str, float]]
 
     # -- High-quality captioning --
     high_quality_captioning: List[bool]
@@ -133,12 +142,20 @@ def initialize_scene_graph_state(
         "cov6": _zeros((0, 6), torch.float32),
         "features": _zeros((0, feature_dim), torch.float32),
         "object_caption": [],
+        "object_vlm_caption": [],
         "object_caption_decision": [],
         "object_category": [],
+        "object_vlm_category": [],
         "object_supercategory": [],
+        "object_vlm_supercategory": [],
         "object_category_candidates": [],
+        "object_category_source": [],
+        "object_category_confidence": [],
+        "object_category_resolution": [],
         "object_key_attributes": [],
         "object_caption_embedding": [],
+        "object_vlm_caption_embedding": [],
+        "object_caption_semantic_reliable": [],
         "object_siglip2_embedding": [],
         "object_qwen3_vl_embedding": [],
         "object_caption_history": [],
@@ -152,6 +169,7 @@ def initialize_scene_graph_state(
         "caption_results_drop_total": 0,
         "object_detection_category": [],
         "object_detection_category_conf": [],
+        "object_detection_category_evidence": [],
         "active": _zeros((0,), torch.bool),
         "object_id": torch.zeros((0,), dtype=torch.int64),
         "id_redirect": {},

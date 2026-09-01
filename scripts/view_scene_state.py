@@ -222,25 +222,20 @@ def main() -> int:
             frame_points = points
         except Exception as exc:  # noqa: BLE001 - cloud is optional context
             print(f"Skipping background cloud ({exc})")
+    dynamic_cloud_path = None
     if args.dynamic_cloud is not None:
         try:
-            with np.load(args.dynamic_cloud.expanduser()) as temporal:
+            dynamic_cloud_path = args.dynamic_cloud.expanduser().resolve()
+            with np.load(dynamic_cloud_path) as temporal:
                 dynamic_points = np.asarray(temporal["xyz"], dtype=np.float32).reshape(-1, 3)
-                dynamic_times = np.asarray(temporal["time_s"], dtype=np.float64).reshape(-1)
-            if len(dynamic_points):
-                normalised = (dynamic_times - dynamic_times.min()) / max(1.0e-9, float(np.ptp(dynamic_times)))
-                dynamic_colors = np.column_stack(
-                    (0.15 + 0.85 * normalised, 0.85 - 0.55 * normalised, 1.0 - 0.75 * normalised)
-                ).astype(np.float32)
-                visualizer.add_background_point_cloud(
-                    dynamic_points,
-                    dynamic_colors,
-                    point_size=max(args.point_size * 1.25, 0.004),
-                    name="/dynamic_4d/history",
-                )
-                print(f"Dynamic 4-D history: {len(dynamic_points):,} x,y,z,t samples from {args.dynamic_cloud}")
+                dynamic_frames = np.unique(np.asarray(temporal["image_id"], dtype=np.int32)).size
+            print(
+                f"Dynamic temporal layer: {len(dynamic_points):,} samples over "
+                f"{dynamic_frames:,} frames (shown one t at a time) from {args.dynamic_cloud}"
+            )
         except Exception as exc:
             print(f"Skipping dynamic 4-D cloud ({exc})")
+            dynamic_cloud_path = None
 
     poses = []
     for rec in state.get("images") or []:
@@ -291,6 +286,7 @@ def main() -> int:
                 playback_fps=max(0.1, float(args.replay_fps)),
                 max_frames=max(0, int(args.max_replay_frames)),
                 title="Saved scene reconstruction",
+                dynamic_cloud_path=dynamic_cloud_path,
             )
             print(f"Playback controls: {replay_controller.total_frames} frames at {args.replay_fps:g} FPS")
         except Exception as exc:  # noqa: BLE001 - static scene viewing remains useful

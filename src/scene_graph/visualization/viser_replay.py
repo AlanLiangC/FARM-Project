@@ -53,10 +53,57 @@ def _object_first_seen_indices(state: dict, frame_count: int) -> np.ndarray:
     return np.clip(first_seen, 0, max(0, int(frame_count) - 1))
 
 
-class FramesJsonReplaySource:
-    """Lazily decode frames and reveal final objects at their first observation."""
+def _gravity_aligned_box(points: np.ndarray) -> dict[str, np.ndarray] | None:
+    """Robust world-Z box for one object snapshot.
 
-    def __init__(self, frames_dir: Path, final_state: dict, *, max_frames: int = 0) -> None:
+    Dynamic masks contain only the visible surface and can include a thin edge
+    of the background.  Percentile trimming keeps that edge from determining
+    the box, while horizontal PCA avoids a camera-axis-aligned footprint.
+    """
+
+    values = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    values = values[np.isfinite(values).all(axis=1)]
+    if len(values) < 8:
+        return None
+    lower, upper = np.quantile(values, [0.01, 0.99], axis=0)
+    trimmed = values[np.all((values >= lower) & (values <= upper), axis=1)]
+    if len(trimmed) >= 8:
+        values = trimmed
+    xy_origin = np.median(values[:, :2], axis=0)
+    centered_xy = values[:, :2] - xy_origin
+    covariance = np.cov(centered_xy, rowvar=False)
+    try:
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+        horizontal_axes = eigenvectors[:, np.argsort(eigenvalues)[::-1]]
+    except np.linalg.LinAlgError:
+        horizontal_axes = np.eye(2, dtype=np.float64)
+    projected = centered_xy @ horizontal_axes
+    projected_low, projected_high = np.quantile(projected, [0.01, 0.99], axis=0)
+    z_low, z_high = np.quantile(values[:, 2], [0.01, 0.99])
+    projected_center = 0.5 * (projected_low + projected_high)
+    center_xy = xy_origin + horizontal_axes @ projected_center
+    yaw = float(np.arctan2(horizontal_axes[1, 0], horizontal_axes[0, 0]))
+    return {
+        "center": np.asarray([center_xy[0], center_xy[1], 0.5 * (z_low + z_high)], dtype=np.float32),
+        "dimensions": np.maximum(
+            np.asarray([*(projected_high - projected_low), z_high - z_low], dtype=np.float32),
+            0.08,
+        ),
+        "wxyz": np.asarray([np.cos(0.5 * yaw), 0.0, 0.0, np.sin(0.5 * yaw)], dtype=np.float32),
+    }
+
+
+class FramesJsonReplaySource:
+    """Decode frames and compose a static background with a time-indexed dynamic layer."""
+
+    def __init__(
+        self,
+        frames_dir: Path,
+        final_state: dict,
+        *,
+        max_frames: int = 0,
+        dynamic_cloud_path: Path | None = None,
+    ) -> None:
         self.frames_dir = Path(frames_dir).expanduser().resolve()
         self.reader = FramesJsonFrameSource(
             self.frames_dir,
@@ -65,17 +112,159 @@ class FramesJsonReplaySource:
         self.final_state = final_state
         self.total_frames = len(self.reader)
         self.first_seen = _object_first_seen_indices(final_state, self.total_frames)
+        self.dynamic_xyz = np.empty((0, 3), dtype=np.float32)
+        self.dynamic_colors = np.empty((0, 3), dtype=np.uint8)
+        self.dynamic_image_ids = np.empty((0,), dtype=np.int32)
+        self.dynamic_object_ids = np.empty((0,), dtype=np.int64)
+        self._dynamic_by_image: dict[int, np.ndarray] = {}
+        self._snapshot_boxes: dict[tuple[int, int], dict[str, np.ndarray]] = {}
+        self._template_boxes: dict[int, dict[str, np.ndarray]] = {}
+        self._trajectory: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        self._object_index_by_id: dict[int, int] = {}
+        self._load_dynamic_layer(dynamic_cloud_path)
+
+    @property
+    def has_dynamic_layer(self) -> bool:
+        return bool(len(self.dynamic_xyz))
+
+    def _load_dynamic_layer(self, path: Path | None) -> None:
+        if path is None:
+            return
+        source = Path(path).expanduser().resolve()
+        if not source.is_file():
+            return
+        with np.load(source) as archive:
+            self.dynamic_xyz = np.asarray(archive["xyz"], dtype=np.float32).reshape(-1, 3)
+            self.dynamic_colors = np.asarray(archive["colors"], dtype=np.uint8).reshape(-1, 3)
+            self.dynamic_image_ids = np.asarray(archive["image_id"], dtype=np.int32).reshape(-1)
+            self.dynamic_object_ids = np.asarray(archive["object_id"], dtype=np.int64).reshape(-1)
+        count = len(self.dynamic_xyz)
+        if not (
+            len(self.dynamic_colors) == count
+            and len(self.dynamic_image_ids) == count
+            and len(self.dynamic_object_ids) == count
+        ):
+            raise ValueError(f"inconsistent dynamic cloud arrays: {source}")
+        for image_id in np.unique(self.dynamic_image_ids):
+            self._dynamic_by_image[int(image_id)] = np.flatnonzero(self.dynamic_image_ids == image_id)
+
+        object_ids = self.final_state.get("object_id")
+        if isinstance(object_ids, torch.Tensor):
+            object_id_values = object_ids.detach().cpu().reshape(-1).tolist()
+        elif object_ids is not None:
+            object_id_values = np.asarray(object_ids).reshape(-1).tolist()
+        else:
+            object_id_values = list(range(len(self.first_seen)))
+        self._object_index_by_id = {int(value): index for index, value in enumerate(object_id_values)}
+
+        temporal_rows = self.final_state.get("object_temporal_observations") or []
+        for object_index, raw_rows in enumerate(temporal_rows):
+            rows = [value for value in (raw_rows or []) if isinstance(value, dict)]
+            samples: list[tuple[int, np.ndarray]] = []
+            for value in rows:
+                if value.get("image_id") is None:
+                    continue
+                position = np.asarray(value.get("position", []), dtype=np.float32).reshape(-1)
+                if position.shape == (3,) and np.isfinite(position).all():
+                    samples.append((int(value["image_id"]), position))
+            if samples:
+                samples.sort(key=lambda value: value[0])
+                self._trajectory[object_index] = (
+                    np.asarray([value[0] for value in samples], dtype=np.int32),
+                    np.stack([value[1] for value in samples]).astype(np.float32),
+                )
+
+        # Stable object dimensions come from the most complete snapshots, not
+        # the often-fragmentary last mask. Snapshot centres/orientations remain
+        # time dependent.
+        for object_id in np.unique(self.dynamic_object_ids):
+            object_samples: list[tuple[int, int, dict[str, np.ndarray]]] = []
+            object_mask = self.dynamic_object_ids == object_id
+            for image_id in np.unique(self.dynamic_image_ids[object_mask]):
+                indices = np.flatnonzero(object_mask & (self.dynamic_image_ids == image_id))
+                box = _gravity_aligned_box(self.dynamic_xyz[indices])
+                if box is None:
+                    continue
+                self._snapshot_boxes[(int(image_id), int(object_id))] = box
+                object_samples.append((len(indices), int(image_id), box))
+            if not object_samples:
+                continue
+            selected = sorted(object_samples, key=lambda value: (value[0], value[1]), reverse=True)[:7]
+            template = dict(selected[0][2])
+            template["dimensions"] = np.median(
+                np.stack([value[2]["dimensions"] for value in selected]), axis=0
+            ).astype(np.float32)
+            self._template_boxes[int(object_id)] = template
+
+    def dynamic_snapshot(self, index: int) -> tuple[np.ndarray, np.ndarray]:
+        indices = self._dynamic_by_image.get(int(index))
+        if indices is None:
+            return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.uint8)
+        return self.dynamic_xyz[indices], self.dynamic_colors[indices]
+
+    def _trajectory_position(self, object_index: int, image_id: int) -> np.ndarray | None:
+        row = self._trajectory.get(int(object_index))
+        if row is None:
+            return None
+        image_ids, positions = row
+        where = int(np.searchsorted(image_ids, int(image_id)))
+        if where < len(image_ids) and int(image_ids[where]) == int(image_id):
+            return positions[where]
+        # Fill only short tracker/detector gaps; never leave a dynamic object
+        # parked indefinitely after it exits the scene.
+        if 0 < where < len(image_ids) and int(image_ids[where] - image_ids[where - 1]) <= 5:
+            span = float(image_ids[where] - image_ids[where - 1])
+            alpha = float(image_id - image_ids[where - 1]) / max(span, 1.0)
+            return (1.0 - alpha) * positions[where - 1] + alpha * positions[where]
+        return None
 
     def _state_at(self, index: int) -> dict:
         state = dict(self.final_state)
         active = self.final_state.get("active")
+        means = self.final_state.get("means")
+        if isinstance(means, torch.Tensor):
+            state["means"] = means.clone()
+        elif means is not None:
+            state["means"] = np.asarray(means).copy()
         visible = self.first_seen <= int(index)
+        overrides: dict[int, dict[str, np.ndarray]] = {}
+        if self.has_dynamic_layer:
+            dynamic_indices = set(self._object_index_by_id.get(int(value), -1) for value in np.unique(self.dynamic_object_ids))
+            dynamic_indices.discard(-1)
+            for object_index in dynamic_indices:
+                visible[object_index] = False
+            for object_id, object_index in self._object_index_by_id.items():
+                if object_index not in dynamic_indices:
+                    continue
+                position = self._trajectory_position(object_index, int(index))
+                if position is None:
+                    continue
+                visible[object_index] = True
+                snapshot = self._snapshot_boxes.get((int(index), int(object_id)))
+                template = self._template_boxes.get(int(object_id))
+                if template is None:
+                    continue
+                box = dict(snapshot or template)
+                box["dimensions"] = template["dimensions"]
+                if snapshot is None:
+                    box["center"] = np.asarray(position, dtype=np.float32)
+                overrides[object_index] = box
+                if isinstance(state.get("means"), torch.Tensor):
+                    state["means"][object_index] = torch.as_tensor(
+                        box["center"],
+                        dtype=state["means"].dtype,
+                        device=state["means"].device,
+                    )
+                elif state.get("means") is not None:
+                    state["means"][object_index] = box["center"]
         if isinstance(active, torch.Tensor):
             mask = torch.as_tensor(visible, dtype=torch.bool, device=active.device)
             state["active"] = active.to(dtype=torch.bool).clone() & mask
         elif active is not None:
             active_np = np.asarray(active, dtype=bool).reshape(-1)
             state["active"] = active_np & visible[: active_np.shape[0]]
+        state["_object_box_overrides"] = overrides
+        state["_temporal_layer_frame"] = int(index)
         return state
 
     def load(self, index: int) -> dict[str, Any]:
@@ -137,6 +326,7 @@ class ViserReplayController:
         self._loop = None
         self._restart = None
         self._full_result = None
+        self._dynamic_handle = None
 
         if preserve_accumulated_cloud:
             points, colors = visualizer.accumulated_point_cloud()
@@ -225,6 +415,22 @@ class ViserReplayController:
             f"### {self.title}\n\n`{message}` · frame **{index + 1} / {self.total_frames}**",
         )
 
+    def _show_dynamic_snapshot(self, index: int) -> None:
+        if self._dynamic_handle is not None:
+            with contextlib.suppress(Exception):
+                self._dynamic_handle.remove()
+            self._dynamic_handle = None
+        points, colors = self.source.dynamic_snapshot(index)
+        if not len(points):
+            return
+        self._dynamic_handle = self.visualizer._server.scene.add_point_cloud(
+            "/dynamic_4d/current",
+            points=np.asarray(points, dtype=np.float32),
+            colors=np.asarray(colors, dtype=np.uint8),
+            point_size=max(0.004, float(self.visualizer._point_size) * 1.25),
+            point_shape="circle",
+        )
+
     def _show_full_result(self) -> None:
         with self._lock:
             has_background = bool(self.visualizer._background_point_handles)
@@ -240,7 +446,12 @@ class ViserReplayController:
                 if handle is not None:
                     with contextlib.suppress(Exception):
                         handle.visible = False
-            self.visualizer.update([], [], [], [], self.source.final_state)
+            if self.source.has_dynamic_layer:
+                payload = self.source.load(self.total_frames - 1)
+                self.visualizer.update([], [], [], [], payload["scene_state"])
+                self._show_dynamic_snapshot(self.total_frames - 1)
+            else:
+                self.visualizer.update([], [], [], [], self.source.final_state)
             self._integrated_until = -1
             self._current_index = self.total_frames - 1
             self._set_slider(self._current_index)
@@ -252,6 +463,30 @@ class ViserReplayController:
             if index == self._integrated_until:
                 self._current_index = index
                 self._set_slider(index)
+                return
+            if self.source.has_dynamic_layer:
+                # The static cloud has already had dynamic-capable masks
+                # removed. Keep it fixed and overlay only the selected time
+                # slice; integrating prior raw RGB-D frames would recreate the
+                # very dynamic trails this representation is meant to avoid.
+                self.visualizer.set_background_visible(True)
+                self.visualizer.reset_streaming_geometry()
+                payload = self.source.load(index)
+                empty_depths = [np.zeros_like(value) for value in payload["depths"]]
+                self.visualizer.update(
+                    payload["colors"],
+                    empty_depths,
+                    payload["intrinsics"],
+                    payload["poses"],
+                    payload["scene_state"],
+                    frame_index=index,
+                    timestamp_ns=int(payload["timestamp_ns"]),
+                )
+                self._show_dynamic_snapshot(index)
+                self._integrated_until = index
+                self._current_index = index
+                self._set_slider(index)
+                self._set_status(index, "STATIC + DYNAMIC t")
                 return
             self.visualizer.set_background_visible(False)
             if self.visualizer._stream_ego_handle is not None:
@@ -326,8 +561,14 @@ def attach_frames_json_replay(
     max_frames: int = 0,
     title: str = "Reconstruction playback",
     preserve_accumulated_cloud: bool = False,
+    dynamic_cloud_path: Path | None = None,
 ) -> ViserReplayController:
-    source = FramesJsonReplaySource(frames_dir, final_state, max_frames=max_frames)
+    source = FramesJsonReplaySource(
+        frames_dir,
+        final_state,
+        max_frames=max_frames,
+        dynamic_cloud_path=dynamic_cloud_path,
+    )
     return ViserReplayController(
         visualizer,
         source,
