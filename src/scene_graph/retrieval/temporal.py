@@ -41,7 +41,7 @@ class TemporalRequest:
 
 
 _ELAPSED_PATTERNS = (
-    re.compile(r"(?:\bat\s*|第\s*)(\d+(?:\.\d+)?)\s*(?:s(?:ec(?:ond)?s?)?|秒)(?:\b|时)?", re.I),
+    re.compile(r"(?:\bat\s*|第\s*|在\s*)?(\d+(?:\.\d+)?)\s*(?:s(?:ec(?:ond)?s?)?|秒)(?:\b|时)?", re.I),
     re.compile(r"(?:time|时间)\s*[=:：]?\s*(\d+(?:\.\d+)?)\s*(?:s|秒)", re.I),
 )
 _FIRST_WINDOW_PATTERNS = (
@@ -86,7 +86,8 @@ _CURRENT_LOCATION = re.compile(
 )
 _SAME_IDENTITY = re.compile(
     r"\b(?:that|the)\s+same\s+(?:object|person|one|target)\b|"
-    r"\bsame\s+(?:identity|instance)\b|同一(?:个)?(?:人|物体|目标|对象)|这个人|该目标",
+    r"\bsame\s+(?:identity|instance)\b|同一(?:个|把|张|台|只|件|位)?"
+    r"(?:人|物体|目标|对象|实例|东西|椅子|桌子|箱子|沙发)|这个人|该目标",
     re.I,
 )
 
@@ -100,6 +101,13 @@ def _remove_match(text: str, match: re.Match[str] | None) -> str:
 def _clean_residual(text: str) -> str:
     # Answer-format and history clauses are hard constraints, not LLM spatial
     # predicates. Keep only the target and static spatial relation.
+    # Insert a clause boundary before a Chinese same-object target, otherwise
+    # the preceding motion-clause cleanup can accidentally consume its noun.
+    text = re.sub(
+        r"的\s*((?:同一)(?:个|把|张|台|只|件|位)?"
+        r"(?:人|物体|目标|对象|实例|东西|椅子|桌子|箱子|沙发))",
+        r"，\1", text, flags=re.I,
+    )
     text = re.sub(
         r"[,，]?\s*(?:and\s+)?where\s+is\s+(?:that(?:\s+same)?|the\s+same|this)\s+"
         r"(?:object|person|one|target)\s+now\s*[?？]?",
@@ -107,6 +115,10 @@ def _clean_residual(text: str) -> str:
     )
     text = re.sub(
         r"[,，]?\s*(?:并且|以及|然后)?\s*(?:这个|该|同一)(?:人|物体|目标|对象)?现在(?:在)?哪里\s*[?？]?",
+        " ", text, flags=re.I,
+    )
+    text = re.sub(
+        r"[,，]?\s*(?:并且|以及|然后)?\s*(?:它|他|她)现在(?:在)?哪里\s*[?？]?",
         " ", text, flags=re.I,
     )
     text = re.sub(
@@ -122,7 +134,13 @@ def _clean_residual(text: str) -> str:
     )
     text = re.sub(r"\b(?:appeared|was\s+visible|could\s+be\s+seen)\b|出现|可见", " ", text, flags=re.I)
     text = re.sub(r"\b(?:later|afterwards|then)\b|(?:之后|后来|随后|然后)", " ", text, flags=re.I)
+    text = re.sub(
+        r"同一(?:个|把|张|台|只|件|位)?"
+        r"(人|物体|目标|对象|实例|东西|椅子|桌子|箱子|沙发)",
+        r"\1", text, flags=re.I,
+    )
     text = re.sub(r"\s+([,，;；?？])", r"\1", text)
+    text = re.sub(r"\s*[,，、;；]+\s*", " ", text)
     text = re.sub(r"^[\s,，;；]+|[\s,，;；]+$", "", text)
     return " ".join(text.split())
 

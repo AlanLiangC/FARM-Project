@@ -105,6 +105,22 @@ def test_chinese_4d_query_has_the_same_structured_constraints() -> None:
     assert "0.8" not in request.cleaned_query
 
 
+def test_chinese_classifier_same_object_clause_is_identity_constraint() -> None:
+    request = parse_temporal_query(
+        "找出在28.6秒时可见、后来移动超过0.8米的同一把椅子，它现在在哪里？",
+        _state(),
+    )
+
+    assert request.mode == "elapsed"
+    assert request.timestamp_ns == 28_600_000_000
+    assert request.require_motion is True
+    assert request.min_displacement_m == 0.8
+    assert request.require_identity_continuity is True
+    assert request.ask_current_location is True
+    assert "椅子" in request.cleaned_query
+    assert "0.8" not in request.cleaned_query
+
+
 def test_historical_scene_slice_uses_window_geometry_and_visibility() -> None:
     state = _state()
     request = parse_temporal_query(QUERY_4D, state)
