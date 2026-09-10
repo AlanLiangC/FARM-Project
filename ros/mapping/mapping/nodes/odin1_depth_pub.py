@@ -127,6 +127,10 @@ class Odin1DepthPublisher(Node):
         self.declare_parameter("depth_dilate_px", 2)
         self.declare_parameter("cloud_buffer_size", 40)
         self.declare_parameter("odom_buffer_size", 4000)
+        self.declare_parameter("cloud_coordinates", "world")
+        self.declare_parameter("output_scale", 1.0)
+        self.declare_parameter("depth_encoding", "32FC1")
+        self.declare_parameter("max_sensor_age_s", 0.0)
 
         gp = lambda n: self.get_parameter(n).value
         self._calib = OdinCalibration.from_yaml(str(gp("calibration_path")))
@@ -144,9 +148,21 @@ class Odin1DepthPublisher(Node):
         self._depth_min = float(gp("depth_min_m"))
         self._depth_max = float(gp("depth_max_m"))
         self._depth_dilate = int(gp("depth_dilate_px"))
+        self._output_scale = float(gp("output_scale"))
+        if not 0.1 <= self._output_scale <= 1.0:
+            raise ValueError("output_scale must be between 0.1 and 1.0")
+        self._depth_encoding = str(gp("depth_encoding")).upper()
+        if self._depth_encoding not in {"16UC1", "32FC1"}:
+            raise ValueError("depth_encoding must be 16UC1 or 32FC1")
+        self._max_sensor_age_s = max(0.0, float(gp("max_sensor_age_s")))
+        self._cloud_coordinates = str(gp("cloud_coordinates")).lower()
+        if self._cloud_coordinates not in {"world", "lidar"}:
+            raise ValueError("cloud_coordinates must be 'world' or 'lidar'")
 
-        self._W = int(self._calib.image_width)
-        self._H = int(self._calib.image_height)
+        self._source_W = int(self._calib.image_width)
+        self._source_H = int(self._calib.image_height)
+        self._W = max(1, int(round(self._source_W * self._output_scale)))
+        self._H = max(1, int(round(self._source_H * self._output_scale)))
         odometry_body_frame = str(gp("odometry_body_frame")).lower()
         if odometry_body_frame == "imu":
             self._T_base_cam = self._calib.T_imu_camera
@@ -158,9 +174,18 @@ class Odin1DepthPublisher(Node):
 
         if self._output_pinhole:
             self._K = self._calib.pinhole_K(focal_scale=self._focal_scale)
-            self._rect_x, self._rect_y = make_fishpoly_rectification_maps(self._calib, self._K)
+            self._K[0, :] *= self._output_scale
+            self._K[1, :] *= self._output_scale
+            self._rect_x, self._rect_y = make_fishpoly_rectification_maps(
+                self._calib,
+                self._K,
+                output_width=self._W,
+                output_height=self._H,
+            )
         else:
-            self._K = self._calib.K
+            self._K = self._calib.K.copy()
+            self._K[0, :] *= self._output_scale
+            self._K[1, :] *= self._output_scale
             self._rect_x = self._rect_y = None
         self._fx, self._fy = float(self._K[0, 0]), float(self._K[1, 1])
         self._cx, self._cy = float(self._K[0, 2]), float(self._K[1, 2])
@@ -217,16 +242,20 @@ class Odin1DepthPublisher(Node):
         from collections import deque as _deque
         self._pending = _deque(maxlen=200)
         self._latest_cloud_t = -1.0
+        self._latest_odom_t = -1.0
         self._stop = False
         self._n_in = 0
         self._n_out = 0
+        self._n_stale = 0
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker.start()
         self.get_logger().info(
             f"odin1_depth_pub: {self._W}x{self._H} "
             f"{'pinhole' if self._output_pinhole else 'fisheye'} K=({self._fx:.1f},{self._fy:.1f},"
             f"{self._cx:.1f},{self._cy:.1f}); image={self._image_topic} cloud={self._cloud_topic} "
-            f"odom={self._odom_topic}; base={self._base_frame} optical={self._optical_frame}"
+            f"odom={self._odom_topic}; base={self._base_frame} optical={self._optical_frame}; "
+            f"cloud_coordinates={self._cloud_coordinates} depth={self._depth_encoding} "
+            f"max_age={self._max_sensor_age_s:.2f}s"
         )
 
     # -- static TF --------------------------------------------------------
@@ -261,6 +290,8 @@ class Odin1DepthPublisher(Node):
             self._odom_t.append(t)
             self._odom_p.append((float(p.x), float(p.y), float(p.z)))
             self._odom_q.append((float(o.x), float(o.y), float(o.z), float(o.w)))
+            if t > self._latest_odom_t:
+                self._latest_odom_t = t
             if len(self._odom_t) > self._odom_max:
                 self._odom_t.pop(0); self._odom_p.pop(0); self._odom_q.pop(0)
         self._publish_map_odometry(msg)
@@ -350,7 +381,12 @@ class Odin1DepthPublisher(Node):
             with self._lock:
                 # Advance to the newest pending image the cloud stream has reached,
                 # dropping older ready frames (stay near real time).
-                while self._pending and _stamp_s(self._pending[0].header) <= self._latest_cloud_t:
+                ready_t = (
+                    self._latest_cloud_t
+                    if self._cloud_coordinates == "lidar"
+                    else min(self._latest_cloud_t, self._latest_odom_t)
+                )
+                while self._pending and _stamp_s(self._pending[0].header) <= ready_t:
                     target = self._pending.popleft()
             if target is None:
                 time.sleep(0.005)
@@ -362,11 +398,24 @@ class Odin1DepthPublisher(Node):
 
     def _process_image(self, msg) -> None:
         import cv2
+        import time
 
+        started = time.perf_counter()
         t_s = _stamp_s(msg.header)
+        sensor_age = self.get_clock().now().nanoseconds * 1e-9 - t_s
+        if self._max_sensor_age_s > 0.0 and sensor_age > self._max_sensor_age_s:
+            self._n_stale += 1
+            if self._n_stale == 1 or self._n_stale % 20 == 0:
+                self.get_logger().warn(
+                    f"odin1_depth_pub: dropped stale input age={sensor_age:.3f}s "
+                    f"(limit={self._max_sensor_age_s:.3f}s, dropped={self._n_stale})"
+                )
+            return
 
         with self._lock:
-            if len(self._odom_t) < 2 or self._odom_t[-1] < t_s:
+            if self._cloud_coordinates == "world" and (
+                len(self._odom_t) < 2 or self._odom_t[-1] < t_s
+            ):
                 return  # not enough odom yet to bracket this frame
             odom_t = list(self._odom_t); odom_p = list(self._odom_p); odom_q = list(self._odom_q)
             nearby = [(t, p) for (t, p) in self._cloud_buf if abs(t - t_s) <= self._scan_window_s]
@@ -377,20 +426,28 @@ class Odin1DepthPublisher(Node):
             self.get_logger().warn(
                 f"odin1_depth_pub: no cloud match img_t={t_s:.3f} "
                 f"cloud_buf[{_cbuf_n}] span=[{_cbuf_lo:.3f},{_cbuf_hi:.3f}] "
-                f"odom_t[-1]={odom_t[-1]:.3f}"
+                f"odom_t[-1]={(odom_t[-1] if odom_t else float('nan')):.3f}"
             )
 
-        try:
-            T_world_base = interpolate_pose_matrix(odom_t, odom_p, odom_q, t_s)
-        except Exception:
-            return
-        T_world_cam = T_world_base @ self._T_base_cam
+        if self._cloud_coordinates == "world":
+            try:
+                T_world_base = interpolate_pose_matrix(odom_t, odom_p, odom_q, t_s)
+            except Exception:
+                return
+            T_projection_cam = T_world_base @ self._T_base_cam
+        else:
+            # cloud_raw is in the LiDAR frame. Treat LiDAR as the temporary
+            # projection world so no SLAM/odometry wait or motion transform is
+            # needed; Tcl_0 maps those points directly into the camera.
+            T_projection_cam = np.linalg.inv(self._calib.T_camera_base)
 
         bgr = self._decode_bgr(msg)
         if bgr is None:
             return
-        if bgr.shape[1] != self._W or bgr.shape[0] != self._H:
-            bgr = cv2.resize(bgr, (self._W, self._H), interpolation=cv2.INTER_AREA)
+        if bgr.shape[1] != self._source_W or bgr.shape[0] != self._source_H:
+            bgr = cv2.resize(
+                bgr, (self._source_W, self._source_H), interpolation=cv2.INTER_AREA
+            )
 
         if nearby:
             if len(nearby) > self._max_scans:
@@ -403,9 +460,12 @@ class Odin1DepthPublisher(Node):
         if self._output_pinhole:
             bgr = cv2.remap(bgr, self._rect_x, self._rect_y, interpolation=cv2.INTER_LINEAR,
                             borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
-            pix, z = project_world_pinhole(pts_world, T_world_cam, self._K)
+            pix, z = project_world_pinhole(pts_world, T_projection_cam, self._K)
         else:
-            pix, z = project_world_fishpoly(pts_world, T_world_cam, self._calib)
+            pix, z = project_world_fishpoly(pts_world, T_projection_cam, self._calib)
+            if self._output_scale != 1.0:
+                bgr = cv2.resize(bgr, (self._W, self._H), interpolation=cv2.INTER_AREA)
+                pix *= self._output_scale
         depth = rasterize_zbuffer(pix, z, self._W, self._H, min_depth=self._depth_min, max_depth=self._depth_max)
         if self._depth_dilate > 0:
             depth = dilate_sparse_depth(depth, radius_px=self._depth_dilate)
@@ -425,9 +485,29 @@ class Odin1DepthPublisher(Node):
         depth_msg.header.stamp = msg.header.stamp
         depth_msg.header.frame_id = self._optical_frame
         depth_msg.height = self._H; depth_msg.width = self._W
-        depth_msg.encoding = "32FC1"; depth_msg.is_bigendian = 0
-        depth_msg.step = self._W * 4
-        depth_msg.data = np.ascontiguousarray(depth).tobytes()
+        depth_msg.is_bigendian = 0
+        if self._depth_encoding == "16UC1":
+            depth_mm = np.clip(np.rint(depth * 1000.0), 0, 65535).astype(np.uint16)
+            depth_msg.encoding = "16UC1"
+            depth_msg.step = self._W * 2
+            depth_msg.data = np.ascontiguousarray(depth_mm).tobytes()
+        else:
+            depth_msg.encoding = "32FC1"
+            depth_msg.step = self._W * 4
+            depth_msg.data = np.ascontiguousarray(depth).tobytes()
+
+        # Projection is latest-only, but a slow host can still finish work after
+        # the observation is no longer safe for control. Never publish such a
+        # frame under its old sensor timestamp as if it were current.
+        publish_age = self.get_clock().now().nanoseconds * 1e-9 - t_s
+        if self._max_sensor_age_s > 0.0 and publish_age > self._max_sensor_age_s:
+            self._n_stale += 1
+            if self._n_stale == 1 or self._n_stale % 20 == 0:
+                self.get_logger().warn(
+                    f"odin1_depth_pub: discarded completed stale frame age={publish_age:.3f}s "
+                    f"(limit={self._max_sensor_age_s:.3f}s, dropped={self._n_stale})"
+                )
+            return
 
         ci = self._camera_info(msg.header.stamp)
         self._pub_rgb_info.publish(ci)
@@ -440,7 +520,9 @@ class Odin1DepthPublisher(Node):
             valid = int(np.count_nonzero(depth > 0.0))
             self.get_logger().info(
                 f"odin1_depth_pub: published {self._n_out} (in={self._n_in}) "
-                f"last valid_depth_px={valid} scans={len(nearby)}"
+                f"last valid_depth_px={valid} scans={len(nearby)} "
+                f"processing_ms={(time.perf_counter() - started) * 1000.0:.1f} "
+                f"sensor_age_ms={publish_age * 1000.0:.1f} stale_dropped={self._n_stale}"
             )
 
 

@@ -199,10 +199,17 @@ def rasterize_zbuffer(
 
 
 def make_fishpoly_rectification_maps(
-    calib: OdinCalibration, K_pinhole: np.ndarray
+    calib: OdinCalibration,
+    K_pinhole: np.ndarray,
+    *,
+    output_width: int | None = None,
+    output_height: int | None = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """cv2.remap maps: pinhole output pixel -> source fisheye pixel."""
-    h, w = int(calib.image_height), int(calib.image_width)
+    h = int(calib.image_height if output_height is None else output_height)
+    w = int(calib.image_width if output_width is None else output_width)
+    if h <= 0 or w <= 0:
+        raise ValueError(f"output size must be positive; got {w}x{h}")
     xs, ys = np.meshgrid(np.arange(w, dtype=np.float64), np.arange(h, dtype=np.float64))
     fx, fy = float(K_pinhole[0, 0]), float(K_pinhole[1, 1])
     cx, cy = float(K_pinhole[0, 2]), float(K_pinhole[1, 2])
@@ -221,6 +228,23 @@ def dilate_sparse_depth(depth: np.ndarray, *, radius_px: int) -> np.ndarray:
     if not np.any(valid) or np.all(valid):
         return src
     import cv2
+
+    # The live adapter normally uses a 1-4 px fill radius. A float min-filter is
+    # dramatically cheaper than a full distance transform and is conservative
+    # for navigation: when several returns cover one empty pixel, retain the
+    # nearest obstacle. Keep the exact nearest-pixel path for larger offline
+    # radii where the shape of the fill matters more than latency.
+    if radius <= 4:
+        sentinel = np.float32(1.0e20)
+        work = np.where(valid, src, sentinel).astype(np.float32)
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1)
+        )
+        nearest_depth = cv2.erode(work, kernel)
+        fill = (~valid) & np.isfinite(nearest_depth) & (nearest_depth < sentinel * 0.5)
+        out = src.copy()
+        out[fill] = nearest_depth[fill]
+        return out
 
     dist_src = np.where(valid, 0, 255).astype(np.uint8)
     dist, labels = cv2.distanceTransformWithLabels(
