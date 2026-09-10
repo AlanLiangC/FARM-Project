@@ -8,8 +8,8 @@ entry in CAMERA_CONFIG* handled by the identical ``frame_pub`` -> ``streaming_ma
 path (one interface, any number / kind of cameras).
 
 Per RGB frame it:
-  1. interpolates the camera pose ``T_world_cam = T_world_base(t) @ inv(Tcl)`` from
-     buffered odometry,
+  1. interpolates the IMU pose and composes the factory IMU/LiDAR and per-device
+     LiDAR/camera extrinsics,
   2. gathers world-frame LiDAR scans within ``±scan_window_s`` (subsampled),
   3. projects them into the camera to synthesise a depth image,
   4. (optional) rectifies RGB+depth to a pinhole model,
@@ -37,6 +37,7 @@ from typing import Deque, List, Optional, Tuple
 import numpy as np
 import rclpy
 from geometry_msgs.msg import TransformStamped
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image, PointCloud2
@@ -100,7 +101,8 @@ class Odin1DepthPublisher(Node):
         self.declare_parameter("out_rgb_info_topic", "/odin1/rect/camera_info")
         self.declare_parameter("out_depth_info_topic", "/odin1/rect/depth/camera_info")
         self.declare_parameter("optical_frame", "odin1_optical")
-        self.declare_parameter("base_frame", "odin1_base_link")
+        self.declare_parameter("base_frame", "odin1_imu")
+        self.declare_parameter("odometry_body_frame", "imu")
         self.declare_parameter("output_pinhole", False)
         self.declare_parameter("rectified_focal_scale", 1.0)
         self.declare_parameter("scan_window_s", 0.15)
@@ -128,7 +130,14 @@ class Odin1DepthPublisher(Node):
 
         self._W = int(self._calib.image_width)
         self._H = int(self._calib.image_height)
-        self._T_base_cam = np.linalg.inv(self._calib.T_camera_base)
+        odometry_body_frame = str(gp("odometry_body_frame")).lower()
+        if odometry_body_frame == "imu":
+            self._T_base_cam = self._calib.T_imu_camera
+        elif odometry_body_frame == "lidar":
+            # Compatibility for old bags that encoded a LiDAR body pose.
+            self._T_base_cam = np.linalg.inv(self._calib.T_camera_base)
+        else:
+            raise ValueError("odometry_body_frame must be 'imu' or 'lidar'")
 
         if self._output_pinhole:
             self._K = self._calib.pinhole_K(focal_scale=self._focal_scale)
@@ -168,7 +177,8 @@ class Odin1DepthPublisher(Node):
         self._pub_rgb_info = self.create_publisher(CameraInfo, str(gp("out_rgb_info_topic")), reliable_qos)
         self._pub_depth_info = self.create_publisher(CameraInfo, str(gp("out_depth_info_topic")), reliable_qos)
 
-        # Static TF base -> optical = inv(Tcl) (pose of the camera in the base frame).
+        # Static TF odometry body -> optical, including the current driver's
+        # IMU<-LiDAR factory extrinsic.
         self._static_tf = StaticTransformBroadcaster(self)
         self._broadcast_static_tf()
 
@@ -378,7 +388,7 @@ def main() -> None:
     node = Odin1DepthPublisher()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node._stop = True

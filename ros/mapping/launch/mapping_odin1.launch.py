@@ -36,7 +36,8 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("scan_window_s", default_value="0.15"),
         DeclareLaunchArgument("max_scans_per_frame", default_value="3"),
         DeclareLaunchArgument("depth_max_m", default_value="60.0"),
-        DeclareLaunchArgument("base_frame", default_value="odin1_base_link"),
+        DeclareLaunchArgument("base_frame", default_value="odin1_imu"),
+        DeclareLaunchArgument("odometry_body_frame", default_value="imu"),
         DeclareLaunchArgument("optical_frame", default_value="odin1_optical"),
         # frame_pub needs an odom frame as its TF target; the Odin bag's odometry
         # header frame is typically "odom".
@@ -65,6 +66,7 @@ def generate_launch_description() -> LaunchDescription:
             "max_scans_per_frame": LaunchConfiguration("max_scans_per_frame"),
             "depth_max_m": LaunchConfiguration("depth_max_m"),
             "base_frame": LaunchConfiguration("base_frame"),
+            "odometry_body_frame": LaunchConfiguration("odometry_body_frame"),
             "optical_frame": LaunchConfiguration("optical_frame"),
         }],
     )

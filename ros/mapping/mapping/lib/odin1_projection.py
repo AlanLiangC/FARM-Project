@@ -6,7 +6,7 @@ a rotating LiDAR. Its ROS2 bag ships:
   * ``/odin1/image[/compressed]``  — BGR8 / JPEG fisheye frames (~10 Hz)
   * ``/odin1/cloud_slam``          — ``PointCloud2`` already in the odom/world
                                      frame (x, y, z[, rgb])
-  * ``/odin1/odometry[_highfreq]`` — ``nav_msgs/Odometry`` (odom -> base_link)
+  * ``/odin1/odometry[_highfreq]`` — ``nav_msgs/Odometry`` (odom -> IMU body)
 
 There is no depth image. To feed the RGBD mapping pipeline we synthesise a depth
 image per RGB frame by projecting the world-frame LiDAR points into the camera at
@@ -18,7 +18,9 @@ the RGB timestamp. The camera uses a polynomial fisheye ("FishPoly") model::
     u, v    = A11*theta_d*cos(phi) + A12*theta_d*sin(phi) + u0,
               A22*theta_d*sin(phi) + v0
 
-``Tcl`` in the calibration maps base(=LiDAR) points into the camera frame.
+``Tcl`` in the calibration maps LiDAR points into the camera frame.  The
+current Odin driver publishes the IMU body pose, so the fixed factory
+IMU<-LiDAR transform is also applied before camera projection.
 
 This module is a trimmed, dependency-light port of the offline largescale
 adapter so the public ROS layer has no dependency on the (eval-only) largescale
@@ -33,6 +35,18 @@ from pathlib import Path
 from typing import List, Tuple
 
 import numpy as np
+
+
+# Factory transform documented by Manifold: P_imu = T_imu_lidar @ P_lidar.
+T_IMU_LIDAR = np.array(
+    [
+        [1.0, 0.0, 0.0, -0.02663],
+        [0.0, 1.0, 0.0, 0.03447],
+        [0.0, 0.0, 1.0, 0.02174],
+        [0.0, 0.0, 0.0, 1.0],
+    ],
+    dtype=np.float64,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +110,12 @@ class OdinCalibration:
              [0.0, 0.0, 1.0]],
             dtype=np.float64,
         )
+
+    @property
+    def T_imu_camera(self) -> np.ndarray:
+        """Camera pose in the Odin IMU body frame (maps camera -> IMU)."""
+
+        return T_IMU_LIDAR @ np.linalg.inv(self.T_camera_base)
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +334,7 @@ def interpolate_pose_matrix(
 
 __all__ = [
     "OdinCalibration",
+    "T_IMU_LIDAR",
     "project_fishpoly",
     "project_world_fishpoly",
     "project_world_pinhole",
