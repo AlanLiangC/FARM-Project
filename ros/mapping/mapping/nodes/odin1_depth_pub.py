@@ -43,6 +43,7 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPo
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image, PointCloud2
 from nav_msgs.msg import Odometry
 from tf2_ros import StaticTransformBroadcaster
+from tf2_msgs.msg import TFMessage
 
 from mapping.lib.odin1_projection import (
     OdinCalibration,
@@ -52,6 +53,7 @@ from mapping.lib.odin1_projection import (
     pointcloud2_to_xyz,
     project_world_fishpoly,
     project_world_pinhole,
+    quat_to_rotmat_xyzw,
     rasterize_zbuffer,
 )
 
@@ -86,6 +88,15 @@ def _matrix_to_quat_xyzw(R: np.ndarray) -> Tuple[float, float, float, float]:
     return x / n, y / n, z / n, w / n
 
 
+def _pose_matrix(position, orientation) -> np.ndarray:
+    out = np.eye(4, dtype=np.float64)
+    out[:3, :3] = quat_to_rotmat_xyzw(
+        (orientation.x, orientation.y, orientation.z, orientation.w)
+    )
+    out[:3, 3] = (position.x, position.y, position.z)
+    return out
+
+
 class Odin1DepthPublisher(Node):
     def __init__(self) -> None:
         super().__init__("odin1_depth_pub")
@@ -100,6 +111,10 @@ class Odin1DepthPublisher(Node):
         self.declare_parameter("out_depth_topic", "/odin1/rect/depth")
         self.declare_parameter("out_rgb_info_topic", "/odin1/rect/camera_info")
         self.declare_parameter("out_depth_info_topic", "/odin1/rect/depth/camera_info")
+        self.declare_parameter("tf_topic", "/tf")
+        self.declare_parameter("out_map_odom_topic", "/odin1/map_odometry")
+        self.declare_parameter("map_frame", "map")
+        self.declare_parameter("odom_frame", "odom")
         self.declare_parameter("optical_frame", "odin1_optical")
         self.declare_parameter("base_frame", "odin1_imu")
         self.declare_parameter("odometry_body_frame", "imu")
@@ -120,6 +135,8 @@ class Odin1DepthPublisher(Node):
         self._odom_topic = str(gp("odom_topic"))
         self._optical_frame = str(gp("optical_frame"))
         self._base_frame = str(gp("base_frame"))
+        self._map_frame = str(gp("map_frame"))
+        self._odom_frame = str(gp("odom_frame"))
         self._output_pinhole = bool(gp("output_pinhole"))
         self._focal_scale = float(gp("rectified_focal_scale"))
         self._scan_window_s = float(gp("scan_window_s"))
@@ -155,6 +172,7 @@ class Odin1DepthPublisher(Node):
         self._odom_t: List[float] = []
         self._odom_p: List[Tuple[float, float, float]] = []
         self._odom_q: List[Tuple[float, float, float, float]] = []
+        self._T_odom_map: Optional[np.ndarray] = None
 
         sensor_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT,
                                 durability=DurabilityPolicy.VOLATILE, history=HistoryPolicy.KEEP_LAST)
@@ -171,11 +189,15 @@ class Odin1DepthPublisher(Node):
         self.create_subscription(img_type, self._image_topic, self._image_cb, sensor_qos)
         self.create_subscription(PointCloud2, self._cloud_topic, self._cloud_cb, cloud_qos)
         self.create_subscription(Odometry, self._odom_topic, self._odom_cb, reliable_qos)
+        self.create_subscription(TFMessage, str(gp("tf_topic")), self._tf_cb, reliable_qos)
 
         self._pub_img = self.create_publisher(Image, str(gp("out_image_topic")), sensor_qos)
         self._pub_depth = self.create_publisher(Image, str(gp("out_depth_topic")), sensor_qos)
         self._pub_rgb_info = self.create_publisher(CameraInfo, str(gp("out_rgb_info_topic")), reliable_qos)
         self._pub_depth_info = self.create_publisher(CameraInfo, str(gp("out_depth_info_topic")), reliable_qos)
+        self._pub_map_odom = self.create_publisher(
+            Odometry, str(gp("out_map_odom_topic")), reliable_qos
+        )
 
         # Static TF odometry body -> optical, including the current driver's
         # IMU<-LiDAR factory extrinsic.
@@ -241,6 +263,45 @@ class Odin1DepthPublisher(Node):
             self._odom_q.append((float(o.x), float(o.y), float(o.z), float(o.w)))
             if len(self._odom_t) > self._odom_max:
                 self._odom_t.pop(0); self._odom_p.pop(0); self._odom_q.pop(0)
+        self._publish_map_odometry(msg)
+
+    def _tf_cb(self, msg: TFMessage) -> None:
+        for transform in msg.transforms:
+            parent = transform.header.frame_id.lstrip("/")
+            child = transform.child_frame_id.lstrip("/")
+            if {parent, child} != {self._odom_frame.lstrip("/"), self._map_frame.lstrip("/")}:
+                continue
+            value = _pose_matrix(
+                transform.transform.translation,
+                transform.transform.rotation,
+            )
+            # The pinned Odin driver publishes odom -> map. Accept the standard
+            # inverse spelling as well so this adapter is robust to driver updates.
+            T_odom_map = value if parent == self._odom_frame.lstrip("/") else np.linalg.inv(value)
+            with self._lock:
+                self._T_odom_map = T_odom_map
+
+    def _publish_map_odometry(self, msg: Odometry) -> None:
+        with self._lock:
+            T_odom_map = None if self._T_odom_map is None else self._T_odom_map.copy()
+        T_odom_body = _pose_matrix(msg.pose.pose.position, msg.pose.pose.orientation)
+        T_map_body = T_odom_body if T_odom_map is None else np.linalg.inv(T_odom_map) @ T_odom_body
+        qx, qy, qz, qw = _matrix_to_quat_xyzw(T_map_body[:3, :3])
+
+        out = Odometry()
+        out.header.stamp = msg.header.stamp
+        out.header.frame_id = self._map_frame
+        out.child_frame_id = msg.child_frame_id or self._base_frame
+        out.pose.pose.position.x = float(T_map_body[0, 3])
+        out.pose.pose.position.y = float(T_map_body[1, 3])
+        out.pose.pose.position.z = float(T_map_body[2, 3])
+        out.pose.pose.orientation.x = qx
+        out.pose.pose.orientation.y = qy
+        out.pose.pose.orientation.z = qz
+        out.pose.pose.orientation.w = qw
+        out.pose.covariance = msg.pose.covariance
+        out.twist = msg.twist
+        self._pub_map_odom.publish(out)
 
     # -- camera_info ------------------------------------------------------
     def _camera_info(self, stamp) -> CameraInfo:
