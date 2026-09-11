@@ -152,8 +152,8 @@ def project_world_fishpoly(
     if pts_world.size == 0:
         return np.zeros((0, 2)), np.zeros((0,))
     T_cam_world = np.linalg.inv(T_world_cam)
-    ones = np.ones((pts_world.shape[0], 1))
-    pts_cam = (T_cam_world @ np.concatenate([pts_world, ones], axis=1).T).T[:, :3]
+    # Avoid allocating an N x 4 homogeneous array for every LiDAR scan.
+    pts_cam = pts_world @ T_cam_world[:3, :3].T + T_cam_world[:3, 3]
     return project_fishpoly(pts_cam, calib), pts_cam[:, 2]
 
 
@@ -163,8 +163,7 @@ def project_world_pinhole(
     if pts_world.size == 0:
         return np.zeros((0, 2)), np.zeros((0,))
     T_cam_world = np.linalg.inv(T_world_cam)
-    ones = np.ones((pts_world.shape[0], 1))
-    pts_cam = (T_cam_world @ np.concatenate([pts_world, ones], axis=1).T).T[:, :3]
+    pts_cam = pts_world @ T_cam_world[:3, :3].T + T_cam_world[:3, 3]
     z = pts_cam[:, 2]
     safe = z > 1e-6
     u = np.full_like(z, np.nan); v = np.full_like(z, np.nan)
@@ -179,8 +178,9 @@ def rasterize_zbuffer(
     *, min_depth: float = 0.1, max_depth: float = 80.0,
 ) -> np.ndarray:
     """Splat (pixels, depth_z) into an (H, W) float32 z-buffer; NaN elsewhere."""
-    out = np.full((H, W), np.nan, dtype=np.float32)
+    out = np.full((H, W), np.inf, dtype=np.float32)
     if pixels.shape[0] == 0:
+        out.fill(np.nan)
         return out
     u, v, z = pixels[:, 0], pixels[:, 1], depth_z
     keep = (np.isfinite(u) & np.isfinite(v) & np.isfinite(z)
@@ -190,11 +190,12 @@ def rasterize_zbuffer(
     ok = (iu >= 0) & (iu < W) & (iv >= 0) & (iv < H)
     iu, iv, z = iu[ok], iv[ok], z[ok]
     if iu.size == 0:
+        out.fill(np.nan)
         return out
     flat = iv * W + iu
-    order = np.lexsort((-z, flat))  # nearest (smallest z) written last -> wins
-    flat = flat[order]; z = z[order]
-    out.reshape(-1)[flat] = z
+    # O(N) scatter-min; lexsort was O(N log N) and dominated live projection.
+    np.minimum.at(out.reshape(-1), flat, z.astype(np.float32, copy=False))
+    out[~np.isfinite(out)] = np.nan
     return out
 
 
@@ -269,24 +270,30 @@ def dilate_sparse_depth(depth: np.ndarray, *, radius_px: int) -> np.ndarray:
 
 def pointcloud2_to_xyz(msg) -> np.ndarray:
     """Decode a ``sensor_msgs/PointCloud2`` to (N,3) float32 XYZ (finite only)."""
-    fields = {f.name: int(f.offset) for f in msg.fields}
+    fields = {f.name: f for f in msg.fields}
     if not all(c in fields for c in ("x", "y", "z")):
         return np.zeros((0, 3), dtype=np.float32)
     point_step = int(msg.point_step)
     n = int(msg.width) * int(msg.height)
     if n == 0 or point_step <= 0:
         return np.zeros((0, 3), dtype=np.float32)
-    buf = bytes(msg.data) if not isinstance(msg.data, bytes) else msg.data
-    arr = np.frombuffer(buf, dtype=np.uint8)
-    if arr.size < n * point_step:
-        n = arr.size // point_step
-    arr = arr[: n * point_step].reshape(n, point_step)
-
-    def _f32(name: str) -> np.ndarray:
-        off = fields[name]
-        return np.frombuffer(arr[:, off:off + 4].tobytes(), dtype=np.float32)
-
-    pts = np.stack([_f32("x"), _f32("y"), _f32("z")], axis=-1)
+    if any(int(getattr(fields[name], "datatype", 7)) != 7 for name in ("x", "y", "z")):
+        raise ValueError("PointCloud2 x/y/z fields must be FLOAT32")
+    buf = memoryview(msg.data)
+    if len(buf) < n * point_step:
+        n = len(buf) // point_step
+    endian = ">" if bool(getattr(msg, "is_bigendian", False)) else "<"
+    dtype = np.dtype(
+        {
+            "names": ["x", "y", "z"],
+            "formats": [f"{endian}f4"] * 3,
+            "offsets": [int(fields[name].offset) for name in ("x", "y", "z")],
+            "itemsize": point_step,
+        }
+    )
+    structured = np.frombuffer(buf, dtype=dtype, count=n)
+    # One compact copy replaces three full-field byte copies in the old decoder.
+    pts = np.stack((structured["x"], structured["y"], structured["z"]), axis=-1)
     return pts[np.isfinite(pts).all(axis=1)].astype(np.float32, copy=False)
 
 

@@ -31,6 +31,7 @@ from __future__ import annotations
 import contextlib
 import sys
 import threading
+import time
 from collections import deque
 from typing import Deque, List, Optional, Tuple
 
@@ -193,20 +194,24 @@ class Odin1DepthPublisher(Node):
         # Buffers.
         self._lock = threading.Lock()
         self._cloud_buf: Deque[Tuple[float, np.ndarray]] = deque(maxlen=int(gp("cloud_buffer_size")))
-        self._odom_max = int(gp("odom_buffer_size"))
+        # LiDAR-frame live projection does not interpolate odometry; retain
+        # only enough history for diagnostics instead of copying 4000 poses.
+        self._odom_max = (
+            2 if self._cloud_coordinates == "lidar" else int(gp("odom_buffer_size"))
+        )
         self._odom_t: List[float] = []
         self._odom_p: List[Tuple[float, float, float]] = []
         self._odom_q: List[Tuple[float, float, float, float]] = []
         self._T_odom_map: Optional[np.ndarray] = None
 
-        sensor_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT,
+        sensor_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT,
                                 durability=DurabilityPolicy.VOLATILE, history=HistoryPolicy.KEEP_LAST)
         reliable_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE,
                                   durability=DurabilityPolicy.VOLATILE, history=HistoryPolicy.KEEP_LAST)
-        # PointCloud2 is large (~0.5 MB/scan); BEST_EFFORT drops most of them, so
-        # subscribe RELIABLE with a deeper queue (matches how `ros2 topic hz` — a
-        # reliable sub — sees the full 8 Hz).
-        cloud_qos = QoSProfile(depth=30, reliability=ReliabilityPolicy.RELIABLE,
+        # Large remote samples use latest-only BEST_EFFORT. Retransmitting a
+        # missed cloud over Wi-Fi is harmful to control: it blocks newer scans
+        # and turns packet loss into seconds of latency.
+        cloud_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT,
                                durability=DurabilityPolicy.VOLATILE, history=HistoryPolicy.KEEP_LAST)
 
         img_type = CompressedImage if self._image_topic.rstrip("/").endswith("compressed") else Image
@@ -240,13 +245,20 @@ class Odin1DepthPublisher(Node):
         # past its timestamp (clouds bracket it) — dropping older ready frames so
         # we stay near real time (latest-ready).
         from collections import deque as _deque
-        self._pending = _deque(maxlen=200)
+        self._pending = _deque(maxlen=32)
         self._latest_cloud_t = -1.0
         self._latest_odom_t = -1.0
         self._stop = False
         self._n_in = 0
         self._n_out = 0
         self._n_stale = 0
+        self._n_unmatched = 0
+        self._n_cloud_in = 0
+        self._rate_image = 0
+        self._rate_cloud = 0
+        self._rate_out = 0
+        self._rate_started = time.monotonic()
+        self._rate_timer = self.create_timer(5.0, self._report_rates)
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker.start()
         self.get_logger().info(
@@ -279,6 +291,8 @@ class Odin1DepthPublisher(Node):
         pts = pointcloud2_to_xyz(msg)
         with self._lock:
             self._cloud_buf.append((t, pts))
+            self._n_cloud_in += 1
+            self._rate_cloud += 1
             if t > self._latest_cloud_t:
                 self._latest_cloud_t = t
 
@@ -352,7 +366,7 @@ class Odin1DepthPublisher(Node):
         import cv2
 
         if isinstance(msg, CompressedImage):
-            buf = np.frombuffer(bytes(msg.data), dtype=np.uint8)
+            buf = np.frombuffer(memoryview(msg.data), dtype=np.uint8)
             return cv2.imdecode(buf, cv2.IMREAD_COLOR)
         enc = (getattr(msg, "encoding", "") or "").lower()
         h, w = int(msg.height), int(msg.width)
@@ -372,6 +386,23 @@ class Odin1DepthPublisher(Node):
         with self._lock:
             self._pending.append(msg)
             self._n_in += 1
+            self._rate_image += 1
+
+    def _report_rates(self) -> None:
+        now = time.monotonic()
+        with self._lock:
+            elapsed = max(1e-6, now - self._rate_started)
+            image_n, cloud_n, out_n = self._rate_image, self._rate_cloud, self._rate_out
+            pending_n = len(self._pending)
+            self._rate_image = self._rate_cloud = self._rate_out = 0
+            self._rate_started = now
+        self.get_logger().info(
+            "odin1_depth_pub rate: "
+            f"image={image_n / elapsed:.2f}Hz cloud={cloud_n / elapsed:.2f}Hz "
+            f"rgbd={out_n / elapsed:.2f}Hz pending={pending_n} "
+            f"total(in={self._n_in}, cloud={self._n_cloud_in}, out={self._n_out}, "
+            f"stale={self._n_stale}, unmatched={self._n_unmatched})"
+        )
 
     def _worker_loop(self) -> None:
         import time
@@ -417,17 +448,33 @@ class Odin1DepthPublisher(Node):
                 len(self._odom_t) < 2 or self._odom_t[-1] < t_s
             ):
                 return  # not enough odom yet to bracket this frame
-            odom_t = list(self._odom_t); odom_p = list(self._odom_p); odom_q = list(self._odom_q)
+            if self._cloud_coordinates == "world":
+                odom_t = list(self._odom_t)
+                odom_p = list(self._odom_p)
+                odom_q = list(self._odom_q)
+            else:
+                odom_t = []
+                odom_p = []
+                odom_q = []
             nearby = [(t, p) for (t, p) in self._cloud_buf if abs(t - t_s) <= self._scan_window_s]
             _cbuf_n = len(self._cloud_buf)
             _cbuf_lo = self._cloud_buf[0][0] if _cbuf_n else float("nan")
             _cbuf_hi = self._cloud_buf[-1][0] if _cbuf_n else float("nan")
-        if not nearby and (self._n_out % 20 == 0):
-            self.get_logger().warn(
-                f"odin1_depth_pub: no cloud match img_t={t_s:.3f} "
-                f"cloud_buf[{_cbuf_n}] span=[{_cbuf_lo:.3f},{_cbuf_hi:.3f}] "
-                f"odom_t[-1]={(odom_t[-1] if odom_t else float('nan')):.3f}"
-            )
+        if not nearby:
+            # An empty projection is not a valid metric-depth observation.  In
+            # particular, publishing an all-zero image here makes navigation
+            # alternate between READY and WAITING_SENSORS even though the next
+            # synchronized scan is healthy.  Keep the last good observation at
+            # the consumer and drop this unmatched RGB frame instead.
+            self._n_unmatched += 1
+            if self._n_unmatched == 1 or self._n_unmatched % 20 == 0:
+                self.get_logger().warn(
+                    f"odin1_depth_pub: dropped RGB without cloud match img_t={t_s:.3f} "
+                    f"cloud_buf[{_cbuf_n}] span=[{_cbuf_lo:.3f},{_cbuf_hi:.3f}] "
+                    f"odom_t[-1]={(odom_t[-1] if odom_t else float('nan')):.3f} "
+                    f"unmatched_dropped={self._n_unmatched}"
+                )
+            return
 
         if self._cloud_coordinates == "world":
             try:
@@ -453,7 +500,10 @@ class Odin1DepthPublisher(Node):
             if len(nearby) > self._max_scans:
                 step = max(1, len(nearby) // self._max_scans)
                 nearby = nearby[::step][: self._max_scans]
-            pts_world = np.concatenate([p for _t, p in nearby], axis=0).astype(np.float64, copy=False)
+            if len(nearby) == 1:
+                pts_world = nearby[0][1]
+            else:
+                pts_world = np.concatenate([p for _t, p in nearby], axis=0)
         else:
             pts_world = np.zeros((0, 3), dtype=np.float64)
 
@@ -516,13 +566,16 @@ class Odin1DepthPublisher(Node):
         self._pub_depth.publish(depth_msg)
 
         self._n_out += 1
+        with self._lock:
+            self._rate_out += 1
         if self._n_out % 20 == 0:
             valid = int(np.count_nonzero(depth > 0.0))
             self.get_logger().info(
                 f"odin1_depth_pub: published {self._n_out} (in={self._n_in}) "
                 f"last valid_depth_px={valid} scans={len(nearby)} "
                 f"processing_ms={(time.perf_counter() - started) * 1000.0:.1f} "
-                f"sensor_age_ms={publish_age * 1000.0:.1f} stale_dropped={self._n_stale}"
+                f"sensor_age_ms={publish_age * 1000.0:.1f} stale_dropped={self._n_stale} "
+                f"unmatched_dropped={self._n_unmatched}"
             )
 
 
